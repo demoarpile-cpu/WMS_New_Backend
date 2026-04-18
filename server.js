@@ -165,14 +165,117 @@ async function start() {
       }
     }
     const syncOptions = { alter: dialect === 'sqlite' };
+    
+    // MySQL Manual Column Fixes helper
+    const applyManualFixes = async () => {
+      if (dialect !== 'mysql') return;
+      console.log('[DB] Applying manual column fixes...');
+      const manualCols = [
+        { t: 'inventory_adjustments', c: 'batch_id', type: 'INT' },
+        { t: 'inventory_adjustments', c: 'batch_number', type: 'VARCHAR(255)' },
+        { t: 'inventory_adjustments', c: 'client_id', type: 'INT' },
+        { t: 'inventory_adjustments', c: 'location_id', type: 'INT' },
+        { t: 'inventory_adjustments', c: 'best_before_date', type: 'DATE' },
+        { t: 'inventory_adjustments', c: 'created_by', type: 'INT' },
+        { t: 'inventory_logs', c: 'batch_id', type: 'INT' },
+        { t: 'inventory_logs', c: 'batch_number', type: 'VARCHAR(255)' },
+        { t: 'inventory_logs', c: 'client_id', type: 'INT' },
+        { t: 'inventory_logs', c: 'location_id', type: 'INT' },
+        { t: 'inventory_logs', c: 'best_before_date', type: 'DATE' },
+        { t: 'inventory_logs', c: 'user_id', type: 'INT' },
+        { t: 'inventory_logs', c: 'reason', type: 'VARCHAR(255)' },
+        { t: 'product_stocks', c: 'batch_id', type: 'INT' },
+        { t: 'product_stocks', c: 'client_id', type: 'INT' },
+        { t: 'product_stocks', c: 'location_id', type: 'INT' },
+        { t: 'product_stocks', c: 'batch_number', type: 'VARCHAR(255)' },
+        { t: 'product_stocks', c: 'reason', type: 'VARCHAR(255)' },
+        { t: 'product_stocks', c: 'best_before_date', type: 'DATE' },
+        { t: 'product_stocks', c: 'user_id', type: 'INT' },
+        { t: 'categories', c: 'company_id', type: 'INT' },
+        { t: 'products', c: 'pack_size', type: 'INT DEFAULT 1' },
+        { t: 'products', c: 'color', type: 'VARCHAR(255)' },
+        { t: 'products', c: 'supplier_id', type: 'INT' },
+        { t: 'products', c: 'alternative_skus', type: 'LONGTEXT' },
+        { t: 'products', c: 'supplier_products', type: 'LONGTEXT' },
+        { t: 'products', c: 'price_lists', type: 'LONGTEXT' },
+        { t: 'products', c: 'cartons', type: 'LONGTEXT' },
+        { t: 'products', c: 'images', type: 'LONGTEXT' },
+        { t: 'products', c: 'marketplace_skus', type: 'LONGTEXT' },
+        { t: 'products', c: 'best_before_date_warning_period_days', type: 'INT DEFAULT 0' },
+        { t: 'purchase_orders', c: 'warehouse_id', type: 'INT' },
+        { t: 'purchase_orders', c: 'client_id', type: 'INT' },
+        { t: 'goods_receipts', c: 'warehouse_id', type: 'INT' },
+        { t: 'goods_receipts', c: 'delivery_type', type: 'VARCHAR(255)' },
+        { t: 'goods_receipts', c: 'eta', type: 'DATETIME' },
+        { t: 'goods_receipts', c: 'total_to_book', type: 'INT DEFAULT 0' },
+        { t: 'movements', c: 'from_warehouse_id', type: 'INT' },
+        { t: 'movements', c: 'to_warehouse_id', type: 'INT' },
+        { t: 'movements', c: 'from_location_id', type: 'INT' },
+        { t: 'movements', c: 'to_location_id', type: 'INT' },
+        { t: 'movements', c: 'batch_id', type: 'INT' },
+        { t: 'movements', c: 'company_id', type: 'INT' },
+        { t: 'movements', c: 'created_by', type: 'INT' },
+        { t: 'zones', c: 'warehouse_id', type: 'INT' },
+        { t: 'zones', c: 'company_id', type: 'INT' },
+        { t: 'locations', c: 'warehouse_id', type: 'INT' },
+        { t: 'locations', c: 'zone_id', type: 'INT' },
+        { t: 'locations', c: 'heat_sensitive', type: 'VARCHAR(255)' },
+        { t: 'users', c: 'company_id', type: 'INT' },
+        { t: 'users', c: 'warehouse_id', type: 'INT' },
+        { t: 'users', c: 'status', type: 'VARCHAR(50) DEFAULT "ACTIVE"' },
+        { t: 'supplier_products', c: 'effective_date', type: 'DATE' },
+        { t: 'goods_receipt_items', c: 'unit_cost', type: 'DECIMAL(12, 2)' },
+        { t: 'reports', c: 'content', type: 'LONGTEXT' },
+        { t: 'reports', c: 'last_run_at', type: 'DATETIME' },
+        { t: 'reports', c: 'report_name', type: 'VARCHAR(255)' },
+        { t: 'reports', c: 'report_type', type: 'VARCHAR(255)' },
+        { t: 'reports', c: 'category', type: 'VARCHAR(255)' },
+        { t: 'reports', c: 'start_date', type: 'DATE' },
+        { t: 'reports', c: 'end_date', type: 'DATE' },
+        { t: 'reports', c: 'format', type: 'VARCHAR(50)' },
+        { t: 'reports', c: 'schedule', type: 'VARCHAR(50)' },
+        { t: 'reports', c: 'status', type: 'VARCHAR(50)' },
+        { t: 'batches', c: 'grn_id', type: 'INT' },
+        { t: 'batches', c: 'client_id', type: 'INT' },
+        { t: 'batches', c: 'company_id', type: 'INT' },
+        { t: 'goods_receipts', c: 'client_id', type: 'INT' },
+        { t: 'goods_receipts', c: 'company_id', type: 'INT' },
+        { t: 'product_stocks', c: 'company_id', type: 'INT' },
+        { t: 'audit_logs', c: 'client_id', type: 'INT' },
+      ];
+      for (const col of manualCols) {
+        try {
+          await sequelize.query(`ALTER TABLE ${col.t} ADD COLUMN ${col.c} ${col.type} NULL`);
+          console.log(`[DB] Column ${col.t}.${col.c} added successfully`);
+        } catch (err) {
+          if (!err.message.includes('Duplicate column') && !err.message.includes('Table') && !err.message.includes("doesn't exist")) {
+            console.warn(`[DB] Column ${col.t}.${col.c} error: ${err.message.slice(0, 60)}`);
+          }
+        }
+      }
+    };
+
     if (dialect === 'mysql') {
       let syncDone = false;
       for (let attempt = 1; attempt <= 3 && !syncDone; attempt += 1) {
         try {
+          // Pre-sync manual columns so unique indexes can be created
+          if (attempt === 1) await applyManualFixes(); 
+          
           await sequelize.sync(syncOptions);
           syncDone = true;
         } catch (syncErr) {
+          console.warn(`[DB] Sync attempt ${attempt} failed: ${syncErr.message.slice(0, 100)}`);
+          
           const brokenTable = getBrokenMySqlTableName(syncErr);
+          const isMissingCol = syncErr.message.includes("doesn't exist") || syncErr.original?.errno === 1072;
+
+          if (isMissingCol) {
+             console.log('[DB] Missing column detected, retrying manual fixes...');
+             await applyManualFixes();
+             continue;
+          }
+
           if (!brokenTable || attempt === 3) {
             throw syncErr;
           }
@@ -186,9 +289,7 @@ async function start() {
           } catch (dropErr) {
             try {
               await sequelize.query('SET FOREIGN_KEY_CHECKS = 1');
-            } catch (_) {
-              // ignore cleanup errors
-            }
+            } catch (_) { /* ignore cleanup errors */ }
             throw dropErr;
           }
         }
@@ -197,86 +298,7 @@ async function start() {
       await sequelize.sync(syncOptions);
     }
     
-    // MySQL: manual column fixes if alter is skipped
-    if (dialect === 'mysql') {
-        const manualCols = [
-          { t: 'inventory_adjustments', c: 'batch_id', type: 'INT' },
-          { t: 'inventory_adjustments', c: 'batch_number', type: 'VARCHAR(255)' },
-          { t: 'inventory_adjustments', c: 'client_id', type: 'INT' },
-          { t: 'inventory_adjustments', c: 'location_id', type: 'INT' },
-          { t: 'inventory_adjustments', c: 'best_before_date', type: 'DATE' },
-          { t: 'inventory_adjustments', c: 'created_by', type: 'INT' },
-          { t: 'inventory_logs', c: 'batch_id', type: 'INT' },
-          { t: 'inventory_logs', c: 'batch_number', type: 'VARCHAR(255)' },
-          { t: 'inventory_logs', c: 'client_id', type: 'INT' },
-          { t: 'inventory_logs', c: 'location_id', type: 'INT' },
-          { t: 'inventory_logs', c: 'best_before_date', type: 'DATE' },
-          { t: 'inventory_logs', c: 'user_id', type: 'INT' },
-          { t: 'inventory_logs', c: 'reason', type: 'VARCHAR(255)' },
-          { t: 'product_stocks', c: 'batch_id', type: 'INT' },
-          { t: 'product_stocks', c: 'client_id', type: 'INT' },
-          { t: 'product_stocks', c: 'location_id', type: 'INT' },
-          { t: 'product_stocks', c: 'batch_number', type: 'VARCHAR(255)' },
-          { t: 'product_stocks', c: 'reason', type: 'VARCHAR(255)' },
-          { t: 'product_stocks', c: 'best_before_date', type: 'DATE' },
-          { t: 'product_stocks', c: 'user_id', type: 'INT' },
-          { t: 'categories', c: 'company_id', type: 'INT' },
-          { t: 'products', c: 'pack_size', type: 'INT DEFAULT 1' },
-          { t: 'products', c: 'color', type: 'VARCHAR(255)' },
-          { t: 'products', c: 'supplier_id', type: 'INT' },
-          { t: 'products', c: 'alternative_skus', type: 'LONGTEXT' },
-          { t: 'products', c: 'supplier_products', type: 'LONGTEXT' },
-          { t: 'products', c: 'price_lists', type: 'LONGTEXT' },
-          { t: 'products', c: 'cartons', type: 'LONGTEXT' },
-          { t: 'products', c: 'images', type: 'LONGTEXT' },
-          { t: 'products', c: 'marketplace_skus', type: 'LONGTEXT' },
-          { t: 'products', c: 'best_before_date_warning_period_days', type: 'INT DEFAULT 0' },
-          { t: 'purchase_orders', c: 'warehouse_id', type: 'INT' },
-          { t: 'purchase_orders', c: 'client_id', type: 'INT' },
-          { t: 'goods_receipts', c: 'warehouse_id', type: 'INT' },
-          { t: 'goods_receipts', c: 'delivery_type', type: 'VARCHAR(255)' },
-          { t: 'goods_receipts', c: 'eta', type: 'DATETIME' },
-          { t: 'goods_receipts', c: 'total_to_book', type: 'INT DEFAULT 0' },
-          { t: 'movements', c: 'from_warehouse_id', type: 'INT' },
-          { t: 'movements', c: 'to_warehouse_id', type: 'INT' },
-          { t: 'movements', c: 'from_location_id', type: 'INT' },
-          { t: 'movements', c: 'to_location_id', type: 'INT' },
-          { t: 'movements', c: 'batch_id', type: 'INT' },
-          { t: 'movements', c: 'company_id', type: 'INT' },
-          { t: 'movements', c: 'created_by', type: 'INT' },
-          { t: 'zones', c: 'warehouse_id', type: 'INT' },
-          { t: 'zones', c: 'company_id', type: 'INT' },
-          { t: 'locations', c: 'warehouse_id', type: 'INT' },
-          { t: 'locations', c: 'zone_id', type: 'INT' },
-          { t: 'locations', c: 'heat_sensitive', type: 'VARCHAR(255)' },
-          { t: 'users', c: 'company_id', type: 'INT' },
-          { t: 'users', c: 'warehouse_id', type: 'INT' },
-          { t: 'users', c: 'status', type: 'VARCHAR(50) DEFAULT "ACTIVE"' },
-          { t: 'supplier_products', c: 'effective_date', type: 'DATE' },
-          { t: 'goods_receipt_items', c: 'unit_cost', type: 'DECIMAL(12, 2)' },
-          { t: 'reports', c: 'content', type: 'LONGTEXT' },
-          { t: 'reports', c: 'last_run_at', type: 'DATETIME' },
-          { t: 'reports', c: 'report_name', type: 'VARCHAR(255)' },
-          { t: 'reports', c: 'report_type', type: 'VARCHAR(255)' },
-          { t: 'reports', c: 'category', type: 'VARCHAR(255)' },
-          { t: 'reports', c: 'start_date', type: 'DATE' },
-          { t: 'reports', c: 'end_date', type: 'DATE' },
-          { t: 'reports', c: 'format', type: 'VARCHAR(50)' },
-          { t: 'reports', c: 'schedule', type: 'VARCHAR(50)' },
-          { t: 'reports', c: 'status', type: 'VARCHAR(50)' },
-        ];
-       for (const col of manualCols) {
-         try { 
-           await sequelize.query(`ALTER TABLE ${col.t} ADD COLUMN ${col.c} ${col.type} NULL`); 
-           console.log(`[DB] Column ${col.t}.${col.c} added successfully`);
-         } catch (err) {
-           if (!err.message.includes('Duplicate column')) {
-             console.warn(`[DB] Column ${col.t}.${col.c} potentially exists or error: ${err.message.slice(0, 60)}`);
-           }
-         }
-       }
-    }
-    console.log('Database synced. (MySQL Manual fixes applied)');
+    console.log('Database synced successfully.');
     // AUTO-SEED DEMO USERS if they don't exist (For 'Proper' Live Demo Experience)
     const bcrypt = require('bcryptjs');
     const { User, Company } = require('./models');
@@ -321,7 +343,8 @@ async function start() {
     cronService.init();
 
     app.listen(PORT, () => {
-      console.log(`WMS Backend running at http://localhost:${PORT}`);
+      const liveUrl = process.env.NODE_ENV === 'production' ? 'https://wms-aksh-backend-production.up.railway.app' : `http://localhost:${PORT}`;
+      console.log(`WMS Backend running at ${liveUrl}`);
       console.log('Auth: POST /auth/login | GET /auth/me (Bearer token)');
       console.log('Super Admin: /api/superadmin/companies');
       console.log('Company: /api/company/profile');
