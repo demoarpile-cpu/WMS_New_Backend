@@ -27,7 +27,7 @@ const Batch = sequelize.define('Batch', {
     }
   },
   grnId: { type: DataTypes.INTEGER, allowNull: true },
-  notes: { type: DataTypes.TEXT, allowNull: true },
+  // notes: { type: DataTypes.TEXT, allowNull: true },
 }, {
   tableName: 'batches',
   timestamps: true,

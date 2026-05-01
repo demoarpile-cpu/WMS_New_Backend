@@ -92,10 +92,10 @@ Zone.hasMany(Location, { foreignKey: 'zoneId' });
 Location.belongsTo(Zone, { foreignKey: 'zoneId' });
 
 // SalesOrder -> OrderItem, PickList, PackingTask, Shipment, Customer
-Customer.hasMany(SalesOrder, { foreignKey: 'customerId' });
-SalesOrder.belongsTo(Customer, { foreignKey: 'customerId' });
-SalesOrder.hasMany(OrderItem, { foreignKey: 'salesOrderId' });
-OrderItem.belongsTo(SalesOrder, { foreignKey: 'salesOrderId' });
+Customer.hasMany(SalesOrder, { foreignKey: 'customerId', as: 'SalesOrders' });
+SalesOrder.belongsTo(Customer, { foreignKey: 'customerId', as: 'Client' });
+SalesOrder.hasMany(OrderItem, { foreignKey: 'salesOrderId', as: 'OrderItems' });
+OrderItem.belongsTo(SalesOrder, { foreignKey: 'salesOrderId', as: 'SalesOrder' });
 OrderItem.belongsTo(Product, { foreignKey: 'productId' });
 Product.hasMany(OrderItem, { foreignKey: 'productId' });
 

@@ -161,7 +161,7 @@ async function charts(req, res, next) {
     const orderItems = await OrderItem.findAll({
       include: [
         {
-          model: SalesOrder,
+          association: 'SalesOrder',
           where: {
             ...baseWhere,
             createdAt: { [Op.gte]: startDate },

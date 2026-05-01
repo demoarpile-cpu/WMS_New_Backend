@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js",
+    "dev": "nodemon server.js || node server.js",
     "seed": "node scripts/seed.js",
     "db:reset": "node scripts/seed.js --reset",
     "create-superadmin": "node scripts/create-superadmin.js",

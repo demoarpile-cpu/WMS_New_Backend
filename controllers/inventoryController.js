@@ -9,11 +9,39 @@ async function listProducts(req, res, next) {
   }
 }
 
+async function exportProducts(req, res, next) {
+  try {
+    const csv = await inventoryService.exportProductsCsv(req.user, req.query);
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="products-${Date.now()}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function scanBarcode(req, res, next) {
   try {
-    const data = await inventoryService.scanBarcode(req.user, req.params.barcode);
+    const rawBarcode = req.params.barcode;
+    const sanitizedBarcode = rawBarcode ? String(rawBarcode).trim() : '';
+    
+    console.log("[SCAN] Incoming Barcode:", rawBarcode, "-> Sanitized:", sanitizedBarcode);
+
+    if (!sanitizedBarcode) {
+      return res.status(400).json({ success: false, message: "Invalid barcode format" });
+    }
+
+    if (!inventoryService || typeof inventoryService.scanBarcode !== 'function') {
+      console.error('CRITICAL: inventoryService.scanBarcode is missing!');
+      return res.status(500).json({ success: false, message: 'Internal configuration error' });
+    }
+
+    const data = await inventoryService.scanBarcode(req.user, sanitizedBarcode);
+    
+    console.log("[SCAN] Success for:", sanitizedBarcode);
     res.json({ success: true, data });
   } catch (err) {
+    console.error("[SCAN] Error for:", req.params.barcode, "->", err.message);
     if (err.message === 'Barcode not found' || err.message === 'Invalid barcode') {
       return res.status(404).json({ success: false, message: 'Invalid barcode' });
     }
@@ -144,6 +172,14 @@ async function listStockByClient(req, res, next) {
 
 async function createStock(req, res, next) {
   try {
+    const companyId = req.user?.companyId;
+    console.log("[DEBUG] createStock User:", req.user);
+    console.log("[DEBUG] createStock Company ID:", companyId);
+
+    if (!companyId) {
+      return res.status(400).json({ success: false, message: "Company ID missing in request" });
+    }
+
     const data = await inventoryService.createStock(req.body, req.user);
     res.status(201).json({ success: true, data });
   } catch (err) {
@@ -201,6 +237,15 @@ async function listAdjustments(req, res, next) {
 
 async function createAdjustment(req, res, next) {
   try {
+    const companyId = req.user?.companyId;
+    const role = req.user?.role;
+    console.log("[DEBUG] createAdjustment User:", req.user);
+    console.log("[DEBUG] createAdjustment Company ID:", companyId);
+
+    if (!companyId && role !== 'super_admin') {
+      return res.status(400).json({ success: false, message: "Company ID missing in request" });
+    }
+
     const data = await inventoryService.createAdjustment(req.body, req.user);
     res.status(201).json({ success: true, data });
   } catch (err) {
@@ -265,6 +310,14 @@ async function getBatch(req, res, next) {
 
 async function createBatch(req, res, next) {
   try {
+    const companyId = req.user?.companyId;
+    console.log("[DEBUG] createBatch User:", req.user);
+    console.log("[DEBUG] createBatch Company ID:", companyId);
+
+    if (!companyId) {
+      return res.status(400).json({ success: false, message: "Company ID missing in request" });
+    }
+
     const data = await inventoryService.createBatch(req.body, req.user);
     res.status(201).json({ success: true, data });
   } catch (err) {
@@ -314,6 +367,14 @@ async function getMovement(req, res, next) {
 
 async function createMovement(req, res, next) {
   try {
+    const companyId = req.user?.companyId;
+    console.log("[DEBUG] createMovement User:", req.user);
+    console.log("[DEBUG] createMovement Company ID:", companyId);
+
+    if (!companyId) {
+      return res.status(400).json({ success: false, message: "Company ID missing in request" });
+    }
+
     const data = await inventoryService.createMovement(req.body, req.user);
     res.status(201).json({ success: true, data });
   } catch (err) {
@@ -362,6 +423,14 @@ async function listInventoryLogs(req, res, next) {
 
 async function stockIn(req, res, next) {
   try {
+    const companyId = req.user?.companyId;
+    console.log("[DEBUG] stockIn User:", req.user);
+    console.log("[DEBUG] stockIn Company ID:", companyId);
+
+    if (!companyId) {
+      return res.status(400).json({ success: false, message: "Company ID missing in request" });
+    }
+
     const data = await inventoryService.stockIn(req.body, req.user);
     res.json({ success: true, data });
   } catch (err) {
@@ -451,4 +520,5 @@ module.exports = {
   stockOut,
   transfer,
   transferStock,
+  exportProducts,
 };

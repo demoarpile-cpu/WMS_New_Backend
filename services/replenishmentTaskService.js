@@ -110,6 +110,7 @@ async function complete(id, reqUser) {
     await toStock.increment('quantity', { by: qty });
   } else {
     await ProductStock.create({
+      companyId: task.companyId,
       productId: task.productId,
       warehouseId: warehouseIdTo,
       locationId: task.toLocationId,

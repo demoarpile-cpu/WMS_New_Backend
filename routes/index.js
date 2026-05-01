@@ -52,5 +52,28 @@ router.use('/api/goods-receiving', goodsReceivingRoutes);
 router.use('/api/replenishment', replenishmentRoutes);
 router.use('/api/returns', returnRoutes);
 router.use('/api/vat-codes', vatCodeRoutes);
+const multer = require('multer');
+const path = require('path');
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, path.join(__dirname, '../uploads')),
+  filename: (req, file, cb) => cb(null, `logo-${Date.now()}${path.extname(file.originalname)}`),
+});
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: (req, file, cb) => {
+    const filetypes = /jpeg|jpg|png|gif/;
+    const mimetype = filetypes.test(file.mimetype);
+    const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
+    if (mimetype && extname) return cb(null, true);
+    cb(new Error('Only image files (jpg, jpeg, png, gif) are allowed!'));
+  }
+});
+router.post('/api/upload', authenticate, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  const fileUrl = `${baseUrl}/uploads/${req.file.filename}`;
+  res.json({ success: true, data: { url: fileUrl } });
+});
 
 module.exports = router;

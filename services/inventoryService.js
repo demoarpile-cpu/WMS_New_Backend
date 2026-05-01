@@ -1,4 +1,4 @@
-const { Product, Category, ProductStock, Warehouse, Company, Supplier, InventoryAdjustment, CycleCount, Batch, Movement, Customer, InventoryLog, Inventory, Location } = require('../models');
+const { Product, Category, ProductStock, Warehouse, Company, Supplier, InventoryAdjustment, CycleCount, Batch, Movement, Customer, InventoryLog, Inventory, Location, sequelize } = require('../models');
 const { Op } = require('sequelize');
 
 /** Ensure product JSON fields from API are proper objects/arrays (e.g. SQLite may return strings) */
@@ -50,11 +50,54 @@ async function validateHeatSensitivePlacement({ product, locationId, actionLabel
   }
 }
 
+async function scanBarcode(reqUser, barcode) {
+  if (!barcode) throw new Error('Invalid barcode');
+  const cleanBarcode = barcode.trim();
+  
+  const where = {
+    [Op.or]: [
+      { barcode: cleanBarcode },
+      { sku: cleanBarcode }
+    ]
+  };
+
+  if (reqUser.role !== 'super_admin') {
+    where.companyId = reqUser.companyId;
+  }
+
+  const product = await Product.findOne({
+    where,
+    include: [
+      { association: 'Category' },
+      { association: 'Company' },
+      { association: 'Supplier' },
+      { 
+        association: 'ProductStocks', 
+        include: [
+          { association: 'Warehouse' }, 
+          { association: 'Location' }
+        ] 
+      },
+      { association: 'Batches' } // Batch belongs to Product, not ProductStock
+    ]
+  });
+
+  if (!product) throw new Error('Barcode or SKU not found');
+  return normalizeProductJson(product);
+}
+
 async function listProducts(reqUser, query = {}) {
   const where = {};
   if (reqUser.role !== 'super_admin') where.companyId = reqUser.companyId;
   else if (query.companyId) where.companyId = query.companyId;
+  
   if (query.categoryId) where.categoryId = query.categoryId;
+  if (query.supplierId) {
+    where[Op.or] = [
+      { supplierId: query.supplierId },
+      { '$SupplierProducts.supplier_id$': query.supplierId }
+    ];
+  }
   if (query.status) where.status = query.status;
   if (query.search) {
     where[Op.or] = [
@@ -71,9 +114,59 @@ async function listProducts(reqUser, query = {}) {
       { association: 'Category', attributes: ['id', 'name', 'code'], required: false },
       { association: 'Company', attributes: ['id', 'name', 'code'], required: false },
       { association: 'ProductStocks', attributes: ['quantity'], required: false },
+      { 
+        association: 'SupplierProducts', 
+        required: false,
+        where: query.supplierId ? { supplierId: query.supplierId } : undefined
+      },
     ],
+    subQuery: false, // Required when using Op.or with includes
   });
   return products;
+}
+
+async function exportProductsCsv(reqUser, query = {}) {
+  const products = await listProducts(reqUser, query);
+  const headers = [
+    'SKU', 'Name', 'Barcode', 'Category', 'Supplier', 'Status', 'Price', 'Cost Price',
+    'VAT Rate', 'Weight', 'Dimensions', 'Reorder Level', 'Stock (Total)', 'Description'
+  ];
+
+  const rows = products.map(p => {
+    const totalStock = (p.ProductStocks || []).reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
+    const weight = `${p.weight || ''} ${p.weightUnit || ''}`.trim();
+    const dims = `${p.length || ''}x${p.width || ''}x${p.height || ''} ${p.dimensionUnit || ''}`.trim();
+
+    return [
+      p.sku,
+      p.name,
+      p.barcode || '',
+      p.Category?.name || '',
+      p.Supplier?.name || '',
+      p.status,
+      p.price,
+      p.costPrice,
+      p.vatRate,
+      weight,
+      dims,
+      p.reorderLevel,
+      totalStock,
+      p.description || ''
+    ];
+  });
+
+  const toCsvCell = (v) => {
+    const s = String(v ?? '');
+    if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replaceAll('"', '""')}"`;
+    return s;
+  };
+
+  const csvContent = [
+    headers.join(','),
+    ...rows.map(line => line.map(toCsvCell).join(','))
+  ].join('\n');
+
+  return csvContent;
 }
 
 async function listCategories(reqUser, query = {}) {
@@ -127,7 +220,23 @@ async function createProduct(data, reqUser) {
     productType: data.productType || null,
     unitOfMeasure: data.unitOfMeasure || null,
     price: data.price ?? 0,
-    costPrice: data.costPrice != null ? data.costPrice : null,
+    costPrice: (function() {
+      // If the frontend already sent the normalized unitCost as costPrice,
+      // and we want to avoid double-division, we need to be careful.
+      // Rule: costPrice = supplierCost / packSize
+      const supplierCost = data.costPrice != null ? Number(data.costPrice) : 0;
+      const packSize = data.packSize != null ? Number(data.packSize) : 1;
+      
+      // If packSize is 1, it's already a unit cost or a single item
+      if (packSize === 1) return supplierCost || null;
+      
+      // If packSize > 1, the frontend might have sent the Case Cost.
+      // But user said "Ensure only unitCost is sent". 
+      // If we strictly follow that, we should NOT divide here if it's already unit cost.
+      // Let's assume the frontend sends what it wants stored in DB.
+      return supplierCost || null;
+    })(),
+    packSize: data.packSize || 1,
     vatRate: data.vatRate != null ? data.vatRate : null,
     vatCode: data.vatCode || null,
     customsTariff: data.customsTariff != null ? String(data.customsTariff) : null,
@@ -275,7 +384,12 @@ async function bulkCreateProducts(productsArray, reqUser) {
         productType: data.productType || null,
         unitOfMeasure: data.unitOfMeasure || null,
         price: data.price != null ? Number(data.price) : 0,
-        costPrice: data.costPrice != null ? Number(data.costPrice) : null,
+        costPrice: (function() {
+          const supplierCost = data.costPrice != null ? Number(data.costPrice) : 0;
+          const packSize = data.packSize != null ? Number(data.packSize) : 1;
+          return packSize > 0 ? (supplierCost / packSize) : supplierCost;
+        })(),
+        packSize: data.packSize != null ? Number(data.packSize) : 1,
         vatRate: data.vatRate != null ? Number(data.vatRate) : null,
         vatCode: data.vatCode || null,
         customsTariff: data.customsTariff != null ? String(data.customsTariff) : null,
@@ -332,6 +446,7 @@ async function updateProduct(id, data, reqUser) {
   if (data.unitOfMeasure !== undefined) upd.unitOfMeasure = data.unitOfMeasure;
   if (data.price !== undefined) upd.price = data.price;
   if (data.costPrice !== undefined) upd.costPrice = data.costPrice;
+  if (data.packSize !== undefined) upd.packSize = data.packSize;
   if (data.vatRate !== undefined) upd.vatRate = data.vatRate;
   if (data.vatCode !== undefined) upd.vatCode = data.vatCode;
   if (data.customsTariff !== undefined) upd.customsTariff = data.customsTariff != null ? String(data.customsTariff) : null;
@@ -470,6 +585,7 @@ async function listStock(reqUser, query = {}) {
       { association: 'Product', where: reqUser.role !== 'super_admin' ? { companyId: reqUser.companyId } : undefined, required: reqUser.role !== 'super_admin' },
       { association: 'Warehouse', include: ['Company'] },
       { association: 'Location', required: false },
+      { association: 'Client', attributes: ['id', 'name', 'code'], required: false },
     ],
   });
   return stocks;
@@ -487,7 +603,7 @@ async function createStock(data, reqUser) {
   }
 
   const stock = await ProductStock.create({
-    companyId: reqUser.companyId,
+    companyId: reqUser.companyId || product.companyId,
     clientId: reqUser.clientId || data.clientId || null,
     productId: data.productId,
     warehouseId: data.warehouseId,
@@ -653,7 +769,7 @@ async function listAdjustments(reqUser, query = {}) {
     where,
     order: [['createdAt', 'DESC']],
     include: [
-      { association: 'Product', attributes: ['id', 'name', 'sku'] },
+      { association: 'Product', attributes: ['id', 'name', 'sku', 'packSize'] },
       { association: 'Warehouse', required: false, attributes: ['id', 'name'] },
       { association: 'createdByUser', required: false, attributes: ['id', 'name', 'email'] },
       { association: 'Location', required: false, attributes: ['id', 'name', 'code'] },
@@ -683,10 +799,10 @@ async function createAdjustment(data, reqUser) {
   const product = await Product.findByPk(data.productId);
   if (!product) throw new Error('Product not found');
   if (effectiveCompanyId && product.companyId !== effectiveCompanyId && role !== 'super_admin') throw new Error('Product not found');
-  if (!String(data.batchNumber || '').trim()) {
+  if (isTruthyYes(product.requireBatchTracking) && !String(data.batchNumber || '').trim()) {
     throw new Error(`${product.name || 'This product'} requires a Batch Number for accurate tracking`);
   }
-  if (!data.bestBeforeDate) {
+  if (isTruthyYes(product.perishable) && !data.bestBeforeDate) {
     throw new Error(`${product.name || 'This product'} requires a Best Before (Expiry) Date`);
   }
 
@@ -729,7 +845,8 @@ async function createAdjustment(data, reqUser) {
     productId: data.productId,
     warehouseId: warehouseId,
     locationId: locationId || null,
-    batchNumber: batchNumber || null
+    batchNumber: batchNumber || null,
+    clientId: clientId || null
   };
 
   let stock = await ProductStock.findOne({ where: stockWhere });
@@ -769,6 +886,7 @@ async function createAdjustment(data, reqUser) {
     });
   } else if (type === 'INCREASE') {
     await ProductStock.create({
+      companyId: effectiveCompanyId,
       productId: data.productId,
       warehouseId,
       locationId,
@@ -817,7 +935,7 @@ async function createAdjustment(data, reqUser) {
   await adjustment.update({ status: 'COMPLETED' });
   return InventoryAdjustment.findByPk(adjustment.id, {
     include: [
-      { association: 'Product', attributes: ['id', 'name', 'sku'] },
+      { association: 'Product', attributes: ['id', 'name', 'sku', 'packSize'] },
       { association: 'Warehouse', required: false, attributes: ['id', 'name'] },
       { association: 'createdByUser', required: false, attributes: ['id', 'name', 'email'] },
       { association: 'Location', required: false, attributes: ['id', 'name', 'code'] },
@@ -991,6 +1109,7 @@ async function completeCycleCount(id, data, reqUser) {
         } else if (diff > 0) {
           await ProductStock.create({
             ...where,
+            companyId: count.companyId,
             quantity: diff,
             status: 'ACTIVE'
           }, { transaction });
@@ -1034,7 +1153,7 @@ async function listBatches(reqUser, query = {}) {
     where,
     order: [['receivedDate', 'DESC'], ['createdAt', 'DESC']],
     include: [
-      { association: 'Product', attributes: ['id', 'name', 'sku'] },
+      { association: 'Product', attributes: ['id', 'name', 'sku', 'packSize'] },
       { association: 'Warehouse', attributes: ['id', 'name', 'code'] },
       { association: 'Location', required: false, attributes: ['id', 'name', 'code', 'aisle', 'rack', 'shelf', 'bin'] },
       { association: 'Supplier', required: false, attributes: ['id', 'name', 'code'] },
@@ -1059,6 +1178,13 @@ async function createBatch(data, reqUser) {
   /* 
    * [MODIFIED] Now also creates/updates ProductStock so batch inventory is live.
    */
+  const packSize = product.packSize || 1;
+  if (!packSize || packSize <= 0) {
+    throw new Error(`Invalid pack size (${packSize}) for product ${product.sku}. Please check product configuration.`);
+  }
+
+  const calculatedUnitCost = data.unitCost != null ? parseFloat(data.unitCost) : 0;
+
   const batch = await Batch.create({
     companyId,
     batchNumber: data.batchNumber || String(Date.now()),
@@ -1067,7 +1193,7 @@ async function createBatch(data, reqUser) {
     locationId: data.locationId || null,
     quantity: parseInt(data.quantity, 10) || 0,
     reserved: 0,
-    unitCost: data.unitCost != null ? parseFloat(data.unitCost) : null,
+    unitCost: calculatedUnitCost,
     receivedDate: data.receivedDate || null,
     expiryDate: data.expiryDate || null,
     manufacturingDate: data.manufacturingDate || null,
@@ -1097,6 +1223,7 @@ async function createBatch(data, reqUser) {
     } else {
       await ProductStock.create({
         ...stockWhere,
+        companyId: batch.companyId,
         quantity: stockQty,
         reserved: 0,
         status: 'ACTIVE',
@@ -1111,7 +1238,7 @@ async function createBatch(data, reqUser) {
 async function getBatchById(id, reqUser) {
   const batch = await Batch.findByPk(id, {
     include: [
-      { association: 'Product', attributes: ['id', 'name', 'sku'] },
+      { association: 'Product', attributes: ['id', 'name', 'sku', 'packSize'] },
       { association: 'Warehouse', attributes: ['id', 'name', 'code'] },
       { association: 'Location', required: false, attributes: ['id', 'name', 'code', 'aisle', 'rack', 'shelf', 'bin'] },
       { association: 'Supplier', required: false, attributes: ['id', 'name', 'code'] },
@@ -1164,7 +1291,7 @@ async function listMovements(reqUser, query = {}) {
     where,
     order: [['createdAt', 'DESC']],
     include: [
-      { association: 'Product', attributes: ['id', 'name', 'sku'] },
+      { association: 'Product', attributes: ['id', 'name', 'sku', 'packSize'] },
       { association: 'Batch', required: false, attributes: ['id', 'batchNumber'] },
       { association: 'fromLocation', required: false, attributes: ['id', 'name', 'code', 'aisle', 'rack', 'shelf', 'bin'] },
       { association: 'toLocation', required: false, attributes: ['id', 'name', 'code', 'aisle', 'rack', 'shelf', 'bin'] },
@@ -1279,6 +1406,7 @@ async function createMovement(data, reqUser) {
       } else {
         await ProductStock.create({
           ...where,
+          companyId,
           quantity: q,
           status: 'ACTIVE'
         }, { transaction });
@@ -1329,7 +1457,7 @@ async function createMovement(data, reqUser) {
 async function getMovementById(id, reqUser) {
   const movement = await Movement.findByPk(id, {
     include: [
-      { association: 'Product', attributes: ['id', 'name', 'sku'] },
+      { association: 'Product', attributes: ['id', 'name', 'sku', 'packSize'] },
       { association: 'Batch', required: false, attributes: ['id', 'batchNumber'] },
       { association: 'fromLocation', required: false, attributes: ['id', 'name', 'code', 'aisle', 'rack', 'shelf', 'bin'] },
       { association: 'toLocation', required: false, attributes: ['id', 'name', 'code', 'aisle', 'rack', 'shelf', 'bin'] },
@@ -1454,6 +1582,8 @@ async function stockIn(data, reqUser) {
     quantity, referenceId, batchNumber, bestBeforeDate, reason 
   } = data;
 
+  if (!clientId) throw new Error('Client is required for stock entry');
+
   const product = await Product.findByPk(productId);
   if (!product) throw new Error('Product not found');
   if (reqUser.role !== 'super_admin' && product.companyId !== reqUser.companyId) throw new Error('Product not found');
@@ -1483,6 +1613,7 @@ async function stockIn(data, reqUser) {
       clientId: clientId || null
     },
     defaults: {
+      companyId: product.companyId,
       quantity: 0,
       reserved: 0,
       bestBeforeDate,
@@ -1520,8 +1651,9 @@ async function stockOut(data, reqUser) {
     where: { productId, warehouseId }
   });
 
-  if (!inventory || inventory.quantity < quantity) {
-    throw new Error('Insufficient stock');
+  const available = (inventory.quantity || 0) - (inventory.reservedQuantity || 0);
+  if (!inventory || available < quantity) {
+    throw new Error(`Insufficient available stock. Total: ${inventory.quantity}, Reserved: ${inventory.reservedQuantity}, Available: ${available}`);
   }
 
   await inventory.decrement('quantity', { by: quantity });
@@ -1544,6 +1676,7 @@ async function transferStock(data, reqUser) {
   const fromWarehouseId = data.fromWarehouseId || data.warehouseId;
   const toWarehouseId = data.toWarehouseId || fromWarehouseId;
 
+  if (!clientId) throw new Error('Client is required for stock transfer');
   if (fromLocationId === toLocationId && fromWarehouseId === toWarehouseId) {
     throw new Error('Source and destination must be different');
   }
@@ -1567,7 +1700,7 @@ async function transferStock(data, reqUser) {
       productId,
       warehouseId: fromWarehouseId,
       locationId: fromLocationId,
-      ...(clientId ? { clientId } : {})
+      clientId: clientId || null
     };
     let source = null;
     if (batchNumber) {
@@ -1593,9 +1726,9 @@ async function transferStock(data, reqUser) {
       order: [['quantity', 'DESC']],
       transaction: t,
     });
-    const availableTotal = sourceRows.reduce((sum, row) => sum + Math.round(Number(row.quantity) || 0), 0);
+    const availableTotal = sourceRows.reduce((sum, row) => sum + Math.round((Number(row.quantity) || 0) - (Number(row.reserved) || 0)), 0);
     if (availableTotal < qty) {
-      throw new Error(`Insufficient stock in source location for this product. Available: ${availableTotal}, Attempted: ${qty}`);
+      throw new Error(`Insufficient available stock in source location for this product. Available: ${availableTotal}, Attempted: ${qty}`);
     }
 
     // 2. Add/Find Destination
@@ -1607,6 +1740,7 @@ async function transferStock(data, reqUser) {
         batchNumber: batchNumber || source.batchNumber || null 
       },
       defaults: { 
+        companyId: product.companyId,
         quantity: 0, 
         reserved: 0, 
         clientId: clientId || source.clientId, 
@@ -1746,9 +1880,172 @@ async function transfer(data, reqUser) {
   });
 }
 
-module.exports = {
+async function reserveStock(data, t) {
+  const { productId, companyId, warehouseId, clientId, quantity } = data;
+
+  if (!productId || !warehouseId || !quantity || quantity <= 0) {
+    throw new Error('Missing required fields for reservation');
+  }
+
+  // 1. Find available stock rows (FIFO: order by createdAt)
+  const stockRows = await ProductStock.findAll({
+    where: {
+      productId,
+      warehouseId,
+      companyId,
+      clientId: clientId || null,
+      quantity: { [Op.gt]: sequelize.col('reserved') }
+    },
+    order: [['createdAt', 'ASC']],
+    transaction: t
+  });
+
+  const totalAvailable = stockRows.reduce((sum, row) => sum + (Number(row.quantity) - Number(row.reserved)), 0);
+  if (totalAvailable < quantity) {
+    throw new Error(`Insufficient available stock for reservation. Requested: ${quantity}, Available: ${totalAvailable}`);
+  }
+
+  let remaining = quantity;
+  for (const row of stockRows) {
+    if (remaining <= 0) break;
+    const availableInRow = Number(row.quantity) - Number(row.reserved);
+    const toReserve = Math.min(availableInRow, remaining);
+    
+    await row.increment('reserved', { by: toReserve, transaction: t });
+    remaining -= toReserve;
+  }
+
+  // 2. Sync Warehouse Inventory
+  const [inv] = await Inventory.findOrCreate({
+    where: { productId, warehouseId },
+    defaults: { quantity: 0, reservedQuantity: 0 },
+    transaction: t
+  });
+  await inv.increment('reservedQuantity', { by: quantity, transaction: t });
+
+  return { success: true };
+}
+
+async function unreserveStock(data, t) {
+  const { productId, companyId, warehouseId, clientId, quantity } = data;
+
+  // Find reserved rows (LIFO: reverse of reserve)
+  const stockRows = await ProductStock.findAll({
+    where: {
+      productId,
+      warehouseId,
+      companyId,
+      clientId: clientId || null,
+      reserved: { [Op.gt]: 0 }
+    },
+    order: [['createdAt', 'DESC']],
+    transaction: t
+  });
+
+  let remaining = quantity;
+  for (const row of stockRows) {
+    if (remaining <= 0) break;
+    const reservedInRow = Number(row.reserved);
+    const toUnreserve = Math.min(reservedInRow, remaining);
+    
+    await row.decrement('reserved', { by: toUnreserve, transaction: t });
+    remaining -= toUnreserve;
+  }
+
+  // Sync Warehouse Inventory
+  const inv = await Inventory.findOne({
+    where: { productId, warehouseId },
+    transaction: t
+  });
+  if (inv) {
+    const toDeduct = Math.min(Number(inv.reservedQuantity), quantity);
+    await inv.decrement('reservedQuantity', { by: toDeduct, transaction: t });
+  }
+
+  return { success: true };
+}
+
+async function shipStock(data, t) {
+  const { productId, companyId, warehouseId, clientId, quantity, referenceId, userId } = data;
+
+  if (!productId || !warehouseId || !quantity || quantity <= 0) {
+    throw new Error('Missing required fields for shipping');
+  }
+
+  // 1. Find stock rows. Prioritize rows with reservations for this client/product.
+  const stockRows = await ProductStock.findAll({
+    where: {
+      productId,
+      warehouseId,
+      companyId,
+      clientId: clientId || null,
+      quantity: { [Op.gt]: 0 }
+    },
+    order: [
+      [sequelize.literal('reserved DESC')], // Prioritize rows that have reservations
+      ['createdAt', 'ASC'] // Then FIFO
+    ],
+    transaction: t,
+    lock: t.LOCK.UPDATE
+  });
+
+  const totalAvailable = stockRows.reduce((sum, row) => sum + Number(row.quantity), 0);
+  if (totalAvailable < quantity) {
+    throw new Error(`Insufficient physical stock for shipment. Requested: ${quantity}, Total Physical: ${totalAvailable}`);
+  }
+
+  let remaining = quantity;
+  for (const row of stockRows) {
+    if (remaining <= 0) break;
+    const rowQty = Number(row.quantity);
+    const rowRes = Number(row.reserved);
+    const toDeduct = Math.min(rowQty, remaining);
+    
+    // Deduct from reserved as much as possible, then from free stock
+    const resDeduct = Math.min(rowRes, toDeduct);
+    
+    await row.decrement('quantity', { by: toDeduct, transaction: t });
+    if (resDeduct > 0) {
+      await row.decrement('reserved', { by: resDeduct, transaction: t });
+    }
+    
+    remaining -= toDeduct;
+  }
+
+  // 2. Sync Warehouse Inventory
+  const inv = await Inventory.findOne({
+    where: { productId, warehouseId },
+    transaction: t,
+    lock: t.LOCK.UPDATE
+  });
+  if (inv) {
+    await inv.decrement('quantity', { by: quantity, transaction: t });
+    const invResDeduct = Math.min(Number(inv.reservedQuantity), quantity);
+    if (invResDeduct > 0) {
+      await inv.decrement('reservedQuantity', { by: invResDeduct, transaction: t });
+    }
+  }
+
+  // 3. Create Log
+  await InventoryLog.create({
+    productId,
+    warehouseId,
+    clientId: clientId || null,
+    type: 'OUT',
+    quantity: -quantity,
+    referenceId: referenceId || 'SHIPMENT',
+    userId,
+    reason: 'Sales Order Shipment'
+  }, { transaction: t });
+
+  return { success: true };
+}
+
+// Standard Exports
+const inventoryService = {
   listProducts,
   listCategories,
+  scanBarcode,
   getProductById,
   createProduct,
   bulkCreateProducts,
@@ -1785,4 +2082,10 @@ module.exports = {
   stockOut,
   transfer,
   transferStock,
+  reserveStock,
+  unreserveStock,
+  shipStock,
+  exportProductsCsv,
 };
+
+module.exports = inventoryService;

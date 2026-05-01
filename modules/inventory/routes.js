@@ -11,6 +11,7 @@ const writeRoles = ['super_admin', 'company_admin', 'inventory_manager'];
 // Scan roles — picker, packer, warehouse_manager can also do adjustments for quick scan
 const scanRoles = ['super_admin', 'company_admin', 'inventory_manager', 'warehouse_manager', 'picker', 'packer'];
 
+router.get('/products/export', requireClient, inventoryController.exportProducts);
 router.get('/products', requireClient, inventoryController.listProducts);
 router.get('/scan/:barcode', requireClient, inventoryController.scanBarcode);
 router.get('/products/:id', requireClient, inventoryController.getProduct);

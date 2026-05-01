@@ -1,4 +1,4 @@
-const { SupplierProduct, Supplier, Product } = require('../models');
+const { SupplierProduct, Supplier, Product, ProductStock } = require('../models');
 const { sequelize } = require('../config/db');
 const { Op } = require('sequelize');
 
@@ -235,18 +235,61 @@ async function listMappedProductsBySupplier(reqUser, supplierId) {
     order: [['effectiveDate', 'DESC'], ['updatedAt', 'DESC']],
   });
 
+  const productIds = mappings.map((m) => m.productId).filter(Boolean);
+  const allStock = await ProductStock.findAll({
+    where: { productId: { [Op.in]: productIds }, companyId },
+    attributes: ['productId', 'quantity', 'bestBeforeDate'],
+    raw: true,
+  });
+
+  const stockMap = new Map();
+  allStock.forEach((s) => {
+    const pid = s.productId;
+    if (!stockMap.has(pid)) {
+      stockMap.set(pid, {
+        totalStock: 0,
+        nearestExpiry: null,
+        nearestExpiryQty: 0,
+        furthestExpiry: null,
+      });
+    }
+    const info = stockMap.get(pid);
+    info.totalStock += Number(s.quantity || 0);
+
+    const bbd = s.bestBeforeDate;
+    if (bbd) {
+      if (!info.nearestExpiry || bbd < info.nearestExpiry) {
+        info.nearestExpiry = bbd;
+        info.nearestExpiryQty = Number(s.quantity || 0);
+      } else if (bbd === info.nearestExpiry) {
+        info.nearestExpiryQty += Number(s.quantity || 0);
+      }
+
+      if (!info.furthestExpiry || bbd > info.furthestExpiry) {
+        info.furthestExpiry = bbd;
+      }
+    }
+  });
+
   // Return every mapping row (multiple supplier SKUs per product are all valid PO lines).
-  return mappings.map((m) => ({
-    mappingId: m.id,
-    productId: m.Product?.id || m.productId,
-    productName: m.supplierProductName || m.Product?.name,
-    productSku: m.supplierSku || m.Product?.sku,
-    internalSku: m.Product?.sku || null,
-    suggestedQuantity: Number(m.Product?.reorderLevel || 1),
-    costPrice: Number(m.costPrice || 0),
-    packSize: Number(m.packSize || 1),
-    supplierId: m.supplierId,
-  }));
+  return mappings.map((m) => {
+    const stock = stockMap.get(m.productId) || { totalStock: 0, nearestExpiry: null, nearestExpiryQty: 0, furthestExpiry: null };
+    return {
+      mappingId: m.id,
+      productId: m.Product?.id || m.productId,
+      productName: m.supplierProductName || m.Product?.name,
+      productSku: m.supplierSku || m.Product?.sku,
+      internalSku: m.Product?.sku || null,
+      suggestedQuantity: Number(m.Product?.reorderLevel || 1),
+      costPrice: Number(m.costPrice || 0),
+      packSize: Number(m.packSize || 1),
+      supplierId: m.supplierId,
+      totalStock: stock.totalStock,
+      nearestExpiry: stock.nearestExpiry,
+      nearestExpiryQty: stock.nearestExpiryQty,
+      furthestExpiry: stock.furthestExpiry,
+    };
+  });
 }
 
 /**

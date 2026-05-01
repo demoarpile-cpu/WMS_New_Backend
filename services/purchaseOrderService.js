@@ -1,4 +1,4 @@
-const { PurchaseOrder, PurchaseOrderItem, Supplier, Product, SupplierProduct } = require('../models');
+const { PurchaseOrder, PurchaseOrderItem, Supplier, Product, SupplierProduct, GoodsReceipt } = require('../models');
 const { Op } = require('sequelize');
 const PDFDocument = require('pdfkit');
 const auditLogService = require('./auditLogService');
@@ -168,13 +168,23 @@ async function update(id, body, reqUser) {
 }
 
 async function approve(id, body, reqUser) {
-  const po = await PurchaseOrder.findByPk(id, { include: ['PurchaseOrderItems'] });
+  const po = await PurchaseOrder.findByPk(id, { include: ['PurchaseOrderItems', 'Supplier'] });
   if (!po) throw new Error('Purchase order not found');
   if (reqUser.role !== 'super_admin' && po.companyId !== reqUser.companyId) throw new Error('Purchase order not found');
   if (reqUser.clientId && po.clientId !== reqUser.clientId) throw new Error('Not authorized to access this client data');
-  if (po.status !== 'pending' && po.status !== 'draft') throw new Error('Only pending/draft PO can be approved/rejected');
 
   const action = String(body.action || 'approve').toLowerCase();
+
+  // If already in target state, just return success (Idempotent)
+  if (action === 'reject' && po.status === 'rejected') return po;
+  if (action === 'approve' && (po.status === 'approved' || po.status === 'asn_sent' || po.status === 'received')) {
+    return getById(id, reqUser);
+  }
+
+  if (po.status !== 'pending' && po.status !== 'draft') {
+    throw new Error(`Only pending/draft PO can be modified. Current status is ${po.status}.`);
+  }
+
   if (action === 'reject') {
     await po.update({ status: 'rejected' });
     return getById(id, reqUser);
@@ -196,13 +206,15 @@ async function approve(id, body, reqUser) {
     status: 'approved',
     expectedDelivery: body.expectedDeliveryDate || body.expectedDelivery || po.expectedDelivery,
   });
+  
+  // Generating ASN automatically
   await generateAsn(id, {
     eta: body.expectedDeliveryDate || body.expectedDelivery || po.expectedDelivery,
     notes: body.notes || `Auto ASN generated on approval for ${po.poNumber}`,
   }, reqUser);
 
   await auditLogService.logAction(reqUser, {
-    action: action === 'reject' ? 'PO_REJECTED' : 'PO_APPROVED',
+    action: 'PO_APPROVED',
     module: 'INBOUND',
     referenceId: po.id,
     referenceNumber: po.poNumber
@@ -246,20 +258,29 @@ async function generateAsn(id, body, reqUser) {
     eta: body.eta || null,
     grNumber,
     status: 'pending',
-    totalExpected: (po.PurchaseOrderItems || []).reduce((s, i) => s + (i.quantity || 0), 0),
+    totalExpected: (po.PurchaseOrderItems || []).reduce((acc, i) => {
+      const q = Number(i.supplierQuantity || i.quantity || 0);
+      const p = Number(i.packSize || 1);
+      return acc + (q * p);
+    }, 0),
     totalReceived: 0,
     notes: body.notes || `ASN generated from ${po.poNumber}`,
   });
 
-  const grItems = (po.PurchaseOrderItems || []).map(i => ({
-    goodsReceiptId: gr.id,
-    productId: i.productId,
-    productName: i.productName,
-    productSku: i.productSku,
-    expectedQty: i.quantity,
-    receivedQty: 0,
-    qtyToBook: i.quantity, // Default qty to book is the expected qty
-  }));
+  const grItems = (po.PurchaseOrderItems || []).map(i => {
+    const qty = Number(i.supplierQuantity || i.quantity || 0);
+    const ps = Number(i.packSize || 1);
+    const total = qty * ps;
+    return {
+      goodsReceiptId: gr.id,
+      productId: i.productId,
+      productName: i.productName,
+      productSku: i.productSku,
+      expectedQty: total,
+      receivedQty: 0,
+      qtyToBook: total, 
+    };
+  });
   if (grItems.length) await GoodsReceiptItem.bulkCreate(grItems);
 
   await po.update({ status: 'asn_sent' });
@@ -441,42 +462,209 @@ async function createFromCsv(body, reqUser) {
 
 async function generatePoPdf(id, reqUser) {
   const po = await getById(id, reqUser);
+  const { Company: CompanyModel, Customer: CustomerModel } = require('../models');
+  const company = await CompanyModel.findByPk(po.companyId);
+  
+  // Priority: Client header > Supplier header > Company header
+  let headerImageUrl = company?.header_image_url;
+  if (po.Supplier?.header_image_url) {
+    headerImageUrl = po.Supplier.header_image_url;
+  }
+  if (po.clientId) {
+    const client = await CustomerModel.findByPk(po.clientId);
+    if (client?.header_image_url) {
+      headerImageUrl = client.header_image_url;
+    }
+  }
+
+  const axios = require('axios');
   const doc = new PDFDocument({ size: 'A4', margin: 40 });
   const buffers = [];
   doc.on('data', (d) => buffers.push(d));
 
-  doc.fontSize(20).text('Purchase Order', { align: 'left' });
-  doc.moveDown(0.3);
-  doc.fontSize(11).text(`PO Number: ${po.poNumber}`);
-  doc.text(`Supplier: ${po.Supplier?.name || '-'}`);
-  doc.text(`Status: ${(po.status || '').toUpperCase()}`);
-  doc.text(`Expected Delivery: ${po.expectedDelivery ? new Date(po.expectedDelivery).toISOString().slice(0, 10) : '-'}`);
-  doc.moveDown();
-  doc.fontSize(12).text('Items', { underline: true });
+  // --- HEADER SECTION ---
+  if (headerImageUrl) {
+    try {
+      let imageBuffer;
+      // Performance: If URL is local, read from disk directly instead of axios
+      if (headerImageUrl.includes('/uploads/')) {
+        const fs = require('fs');
+        const path = require('path');
+        const fileName = headerImageUrl.split('/uploads/').pop();
+        const filePath = path.join(__dirname, '../uploads', fileName);
+        if (fs.existsSync(filePath)) {
+          imageBuffer = fs.readFileSync(filePath);
+        }
+      }
+
+      // Fallback to axios if buffer not populated (or external URL)
+      if (!imageBuffer) {
+        const response = await axios.get(headerImageUrl, { 
+          responseType: 'arraybuffer',
+          timeout: 5000 // 5 second timeout
+        });
+        imageBuffer = Buffer.from(response.data, 'binary');
+      }
+
+      if (imageBuffer) {
+        const maxW = 150; // Reduced from 250 to make it smaller
+        const maxH = 60;  // Reduced from 100 to make it smaller
+        
+        const img = doc.openImage(imageBuffer);
+        const ratio = Math.min(maxW / img.width, maxH / img.height);
+        const displayHeight = img.height * ratio;
+        const displayWidth = img.width * ratio;
+
+        // Logo on Top-Left
+        doc.image(imageBuffer, 40, 40, { width: displayWidth, height: displayHeight });
+        
+        // Company Info on Top-Right
+        doc.fontSize(14).font('Helvetica-Bold').fillColor('#333333');
+        doc.text(company?.name || '', 300, 40, { align: 'right', width: 255 });
+        doc.fontSize(9).font('Helvetica').fillColor('#666666');
+        doc.text(company?.address || '', 300, 58, { align: 'right', width: 255 });
+        if (company?.phone || company?.email) {
+          doc.text(`${company?.phone || ''} ${company?.email ? '| ' + company?.email : ''}`, 300, doc.y, { align: 'right', width: 255 });
+        }
+        
+        doc.y = Math.max(40 + displayHeight, doc.y) + 20;
+      } else {
+        throw new Error('Image buffer empty');
+      }
+    } catch (err) {
+      console.error('Failed to load professional header image:', err.message);
+      doc.y = 40;
+      doc.fontSize(22).font('Helvetica-Bold').fillColor('#333333').text('PURCHASE ORDER', { align: 'left' });
+      doc.moveDown(0.5);
+    }
+  } else {
+    doc.y = 40;
+    doc.fontSize(22).font('Helvetica-Bold').fillColor('#333333').text('PURCHASE ORDER', { align: 'left' });
+    
+    // Even without logo, show company info on right
+    doc.fontSize(14).font('Helvetica-Bold').fillColor('#333333');
+    doc.text(company?.name || '', 300, 40, { align: 'right', width: 255 });
+    doc.fontSize(9).font('Helvetica').fillColor('#666666');
+    doc.text(company?.address || '', 300, 58, { align: 'right', width: 255 });
+    
+    doc.y = Math.max(80, doc.y) + 10;
+  }
+
+  // Draw a clean separator line
+  doc.moveTo(40, doc.y).lineTo(555, doc.y).strokeColor('#eeeeee').lineWidth(1).stroke();
+  doc.moveDown(1.5);
+  
+  doc.fontSize(18).font('Helvetica-Bold').fillColor('#333333').text('Purchase Order', 40, doc.y);
   doc.moveDown(0.5);
-  doc.fontSize(10).text('SKU', 40, doc.y, { width: 100 });
-  doc.text('Product', 140, doc.y - 12, { width: 200 });
-  doc.text('Qty', 350, doc.y - 12, { width: 50, align: 'right' });
-  doc.text('Unit Price', 410, doc.y - 12, { width: 70, align: 'right' });
-  doc.text('Total', 490, doc.y - 12, { width: 70, align: 'right' });
-  doc.moveDown(0.4);
+
+  doc.moveDown(0.3);
+  doc.fontSize(10).fillColor('#444444');
+  doc.text(`PO Number: `, { continued: true }).fillColor('#000000').text(po.poNumber);
+  doc.fillColor('#444444').text(`Supplier: `, { continued: true }).fillColor('#000000').text(po.Supplier?.name || '-');
+  doc.fillColor('#444444').text(`Status: `, { continued: true }).fillColor('#000000').text((po.status || '').toUpperCase());
+  
+  // Date logic
+  const orderDate = po.createdAt ? new Date(po.createdAt).toLocaleDateString('en-GB') : '-';
+  doc.fillColor('#444444').text(`Order Date: `, { continued: true }).fillColor('#000000').text(orderDate);
+  
+  if (po.expectedDelivery) {
+    const deliveryDate = new Date(po.expectedDelivery).toLocaleDateString('en-GB');
+    doc.fillColor('#444444').text(`Expected Delivery: `, { continued: true }).fillColor('#000000').text(deliveryDate);
+  }
+  
+  doc.moveDown();
+  doc.fontSize(12).fillColor('#000000').text('Order Details', { underline: true });
+  doc.moveDown(0.5);
+
+  // --- TABLE HEADERS ---
+  const tableTop = doc.y;
+  doc.fontSize(9).font('Helvetica-Bold').fillColor('#444444');
+  doc.text('SKU (Supplier)', 40, tableTop, { width: 80 });
+  doc.text('Product (Supplier)', 125, tableTop, { width: 150 });
+  doc.text('Qty', 275, tableTop, { width: 40, align: 'right' });
+  doc.text('Price (Pack)', 315, tableTop, { width: 65, align: 'right' });
+  doc.text('VAT%', 385, tableTop, { width: 35, align: 'right' });
+  doc.text('VAT Total', 425, tableTop, { width: 65, align: 'right' });
+  doc.text('Net Total', 495, tableTop, { width: 75, align: 'right' });
+  
+  doc.moveTo(40, tableTop + 14).lineTo(570, tableTop + 14).strokeColor('#000000').lineWidth(0.5).stroke();
+  doc.y = tableTop + 20;
+
+  let totalNet = 0;
+  let totalVat = 0;
 
   for (const item of (po.PurchaseOrderItems || [])) {
-    const lineY = doc.y;
-    doc.fontSize(10).text(item.productSku || '-', 40, lineY, { width: 100 });
-    doc.text(item.productName || '-', 140, lineY, { width: 200 });
-    doc.text(String(item.quantity || 0), 350, lineY, { width: 50, align: 'right' });
-    doc.text(Number(item.unitPrice || 0).toFixed(2), 410, lineY, { width: 70, align: 'right' });
-    doc.text(Number(item.totalPrice || 0).toFixed(2), 490, lineY, { width: 70, align: 'right' });
-    doc.moveDown(0.6);
+    if (doc.y > 750) {
+      doc.addPage();
+      doc.fontSize(9).font('Helvetica-Bold').fillColor('#444444');
+      doc.text('SKU (Supplier)', 40, 40, { width: 80 });
+      doc.text('Product (Supplier)', 125, 40, { width: 150 });
+      doc.text('Qty', 275, 40, { width: 40, align: 'right' });
+      doc.text('Price (Pack)', 315, 40, { width: 65, align: 'right' });
+      doc.moveTo(40, 54).lineTo(570, 54).stroke();
+      doc.y = 60;
+    }
+
+    const totalUnits = Number(item.quantity || 0);
+    const packSize = Number(item.packSize || 1);
+    const unitPrice = Number(item.unitPrice || 0);
+    const vatRate = Number(item.Product?.vatRate || 0);
+
+    const qtyPacks = totalUnits / packSize;
+    const pricePerPack = unitPrice * packSize;
+    const lineNet = totalUnits * unitPrice;
+    const lineVat = lineNet * (vatRate / 100);
+    
+    totalNet += lineNet;
+    totalVat += lineVat;
+
+    const rowY = doc.y;
+    doc.fontSize(8).font('Helvetica').fillColor('#000000');
+    
+    // Use the same Y for all columns in a row to prevent overlapping
+    doc.text(item.productSku || '-', 40, rowY, { width: 80, ellipsis: true });
+    doc.text(item.productName || '-', 125, rowY, { width: 150, ellipsis: true });
+    doc.text(qtyPacks % 1 === 0 ? String(qtyPacks) : qtyPacks.toFixed(2), 275, rowY, { width: 40, align: 'right' });
+    doc.text(`£${pricePerPack.toFixed(2)}`, 315, rowY, { width: 65, align: 'right' });
+    doc.text(`${vatRate}%`, 385, rowY, { width: 35, align: 'right' });
+    doc.text(`£${lineVat.toFixed(2)}`, 425, rowY, { width: 65, align: 'right' });
+    doc.text(`£${lineNet.toFixed(2)}`, 495, rowY, { width: 75, align: 'right' });
+    
+    doc.y = rowY + 15; // Consistent line spacing
   }
 
-  doc.moveDown();
-  doc.fontSize(12).text(`Total Amount: ${Number(po.totalAmount || 0).toFixed(2)}`, { align: 'right' });
+  // --- FOOTER SECTION (TOTALS) ---
+  const totalAmount = totalNet + totalVat;
+  doc.moveDown(1);
+  if (doc.y > 730) doc.addPage();
+  
+  const footerX = 350;
+  const valueX = 500;
+  const footerYStart = doc.y;
+
+  doc.moveTo(footerX, footerYStart).lineTo(570, footerYStart).strokeColor('#eeeeee').stroke();
+  doc.moveDown(0.5);
+  
+  const drawSummaryRow = (label, value, isBold = false) => {
+    const y = doc.y;
+    doc.fontSize(isBold ? 10 : 9).font(isBold ? 'Helvetica-Bold' : 'Helvetica');
+    doc.fillColor('#444444').text(label, footerX, y, { width: 140, align: 'right' });
+    doc.fillColor('#000000').text(`£${value}`, valueX, y, { width: 70, align: 'right' });
+    doc.y = y + 15;
+  };
+
+  drawSummaryRow('Total Net Amount:', totalNet.toFixed(2));
+  drawSummaryRow('Total VAT Amount:', totalVat.toFixed(2));
+  doc.moveDown(0.2);
+  drawSummaryRow('Total Amount (Final):', totalAmount.toFixed(2), true);
+
   if (po.notes) {
-    doc.moveDown();
-    doc.fontSize(10).text(`Notes: ${po.notes}`);
+    doc.font('Helvetica').fontSize(9).fillColor('#666666');
+    doc.moveDown(2);
+    doc.text('Notes:', 40, doc.y);
+    doc.text(po.notes, 40, doc.y, { width: 400 });
   }
+
   doc.end();
   const buffer = await new Promise((resolve) => doc.on('end', () => resolve(Buffer.concat(buffers))));
   return { buffer, filename: `${po.poNumber || `PO-${po.id}`}.pdf` };
