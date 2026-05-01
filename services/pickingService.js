@@ -18,7 +18,7 @@ async function list(reqUser, query = {}) {
   const orderInclude = {
     association: 'SalesOrder',
     attributes: ['id', 'orderNumber', 'status', 'companyId'],
-    include: [{ association: 'Customer', attributes: ['name'] }]
+    include: [{ association: 'Client', attributes: ['name'] }]
   };
   if (reqUser.role === 'warehouse_manager' || reqUser.role === 'company_admin') {
     orderInclude.where = { companyId: reqUser.companyId };
@@ -43,7 +43,7 @@ async function list(reqUser, query = {}) {
 async function getById(id, reqUser) {
   const pickList = await PickList.findByPk(id, {
     include: [
-      { association: 'SalesOrder', include: ['Customer'] },
+      { association: 'SalesOrder', include: ['Client'] },
       { association: 'Warehouse' },
       { association: 'User', attributes: { exclude: ['passwordHash'] }, required: false },
       { association: 'PickListItems', include: ['Product'] },

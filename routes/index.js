@@ -54,12 +54,20 @@ router.use('/api/returns', returnRoutes);
 router.use('/api/vat-codes', vatCodeRoutes);
 const multer = require('multer');
 const path = require('path');
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, path.join(__dirname, '../uploads')),
-  filename: (req, file, cb) => cb(null, `logo-${Date.now()}${path.extname(file.originalname)}`),
-});
+let cloudinary;
+try {
+  cloudinary = require('cloudinary').v2;
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
+  });
+} catch (err) {
+  console.error('WARNING: Cloudinary module not found. Image uploads will fail. Run "npm install cloudinary" to fix.');
+}
+
 const upload = multer({ 
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
   fileFilter: (req, file, cb) => {
     const filetypes = /jpeg|jpg|png|gif/;
@@ -69,11 +77,33 @@ const upload = multer({
     cb(new Error('Only image files (jpg, jpeg, png, gif) are allowed!'));
   }
 });
-router.post('/api/upload', authenticate, upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-  const baseUrl = `${req.protocol}://${req.get('host')}`;
-  const fileUrl = `${baseUrl}/uploads/${req.file.filename}`;
-  res.json({ success: true, data: { url: fileUrl } });
+
+router.post('/api/upload', authenticate, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+
+    if (!cloudinary) {
+      return res.status(500).json({ success: false, message: 'Cloudinary module not installed. Please run "npm install cloudinary" on the server.' });
+    }
+    
+    // Upload to Cloudinary using buffer
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        { folder: 'wms_uploads' },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      uploadStream.end(req.file.buffer);
+    });
+
+    res.json({ success: true, data: { url: result.secure_url } });
+  } catch (err) {
+    console.error('Cloudinary Upload Error:', err);
+    res.status(500).json({ success: false, message: 'Upload to Cloudinary failed' });
+  }
 });
+
 
 module.exports = router;

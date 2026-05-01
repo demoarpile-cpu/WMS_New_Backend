@@ -17,7 +17,7 @@ async function list(reqUser, query = {}) {
       { association: 'Company', attributes: ['id', 'name', 'code'] },
       { association: 'Client', attributes: ['id', 'name', 'email', 'address', 'city', 'state', 'country', 'postcode'] },
       { association: 'OrderItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku', 'weight', 'weightUnit'] }] },
-      { association: 'PickLists', include: [{ association: 'PickListItems', include: [{ association: 'Location' }] }] },
+      { association: 'PickLists', include: [{ association: 'PickListItems', include: [{ association: 'Product' }] }] },
       { association: 'Shipment' },
     ],
   });

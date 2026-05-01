@@ -11,7 +11,7 @@ async function list(reqUser, query = {}) {
     where,
     order: [['createdAt', 'DESC']],
     include: [
-      { association: 'SalesOrder', attributes: ['id', 'orderNumber', 'status'], include: ['Customer'] },
+      { association: 'SalesOrder', attributes: ['id', 'orderNumber', 'status'], include: ['Client'] },
       { association: 'Company', attributes: ['id', 'name', 'code'] },
       { association: 'User', attributes: ['id', 'name', 'email'], required: false },
     ],
@@ -22,7 +22,7 @@ async function list(reqUser, query = {}) {
 async function getById(id, reqUser) {
   const shipment = await Shipment.findByPk(id, {
     include: [
-      { association: 'SalesOrder', include: ['Customer', 'OrderItems'] },
+      { association: 'SalesOrder', include: ['Client', 'OrderItems'] },
       { association: 'Company' },
       { association: 'User', attributes: { exclude: ['passwordHash'] }, required: false },
     ],

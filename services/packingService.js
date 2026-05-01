@@ -26,7 +26,7 @@ async function list(reqUser, query = {}) {
         where: (reqUser.companyId ? { companyId: reqUser.companyId } : {}),
         required: true,
         attributes: ['id', 'orderNumber', 'status'],
-        include: ['Customer']
+        include: ['Client']
       },
       {
         association: 'PickList',
@@ -44,7 +44,7 @@ async function list(reqUser, query = {}) {
 async function getById(id, reqUser) {
   const task = await PackingTask.findByPk(id, {
     include: [
-      { association: 'SalesOrder', include: ['OrderItems', 'Customer'] },
+      { association: 'SalesOrder', include: ['OrderItems', 'Client'] },
       { association: 'PickList', include: ['PickListItems'] },
       { association: 'User', attributes: { exclude: ['passwordHash'] }, required: false },
     ],
