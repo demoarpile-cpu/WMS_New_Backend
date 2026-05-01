@@ -84,7 +84,9 @@ async function create(body, reqUser) {
     include: [{ association: 'PurchaseOrderItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku'] }] }],
   });
   if (!po || po.companyId !== companyId) throw new Error('Purchase order not found');
-  if ((po.status || '').toLowerCase() !== 'approved') throw new Error('Only approved purchase orders can be received');
+  if (!['approved', 'pending', 'draft', 'asn_sent'].includes((po.status || '').toLowerCase())) {
+    throw new Error('Only approved or pending purchase orders can be received');
+  }
 
   // GRN number format: GRN001, GRN002, GRN003, ... (sequential per company)
   const all = await GoodsReceipt.findAll({ where: { companyId }, attributes: ['grNumber'], raw: true });
@@ -109,6 +111,9 @@ async function create(body, reqUser) {
     totalExpected,
     totalReceived: 0,
   });
+
+  // Update PO status to reflect it's now being processed (ASN stage)
+  await po.update({ status: 'asn_sent' });
 
   const items = (po.PurchaseOrderItems || []).map((i) => ({
     goodsReceiptId: gr.id,
