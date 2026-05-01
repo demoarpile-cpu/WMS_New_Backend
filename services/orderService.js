@@ -1,4 +1,4 @@
-const { SalesOrder, OrderItem, Product, Customer, Company, PickList, PickListItem, PackingTask, Warehouse, Shipment, sequelize } = require('../models');
+const { SalesOrder, OrderItem, Product, Customer, Company, PickList, PickListItem, PackingTask, Warehouse, Shipment, ProductStock, sequelize } = require('../models');
 const { Op } = require('sequelize');
 const inventoryService = require('./inventoryService');
 
@@ -16,7 +16,7 @@ async function list(reqUser, query = {}) {
     include: [
       { association: 'Company', attributes: ['id', 'name', 'code'] },
       { association: 'Client', attributes: ['id', 'name', 'email', 'address', 'city', 'state', 'country', 'postcode'] },
-      { association: 'OrderItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku', 'weight', 'weightUnit'] }] },
+      { association: 'OrderItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku', 'weight', 'weightUnit'] }, { association: 'Warehouse', attributes: ['id', 'name'] }] },
       { association: 'PickLists', include: [{ association: 'PickListItems', include: [{ association: 'Product' }] }] },
       { association: 'Shipment' },
     ],
@@ -29,7 +29,7 @@ async function getById(id, reqUser) {
     include: [
       { association: 'Company' },
       { association: 'Client' },
-      { association: 'OrderItems', include: ['Product'] },
+      { association: 'OrderItems', include: ['Product', 'Warehouse'] },
       { association: 'PickLists', include: ['PickListItems', 'Warehouse', 'User'] },
       { association: 'PackingTasks', include: ['User'] },
       { association: 'Shipment' },
@@ -76,34 +76,46 @@ async function create(data, reqUser) {
         const unitPrice = row.unitPrice ?? product.price;
         const qty = row.quantity || 1;
         
-        await OrderItem.create({
-          salesOrderId: order.id,
-          productId: product.id,
-          quantity: qty,
-          unitPrice: unitPrice,
-        }, { transaction: t });
-        
-        total += Number(unitPrice) * qty;
-
         // RESERVE STOCK
-        // Instead of using a fixed warehouse for the whole order, 
-        // we try to find where the stock is for this specific product.
-        let targetWarehouseId = warehouse?.id;
+        // We prioritize the warehouse selected by the user (row.warehouseId).
+        // If not provided, we fall back to the default warehouse.
+        let targetWarehouseId = row.warehouseId || warehouse?.id;
         
         // Check if stock exists in the "default" warehouse first
         const hasStockInDefault = warehouse ? await ProductStock.findOne({
-          where: { productId: product.id, warehouseId: warehouse.id, companyId, clientId: data.customerId || null, quantity: { [Op.gt]: sequelize.col('reserved') } },
+          where: { 
+            productId: product.id, 
+            warehouseId: warehouse.id, 
+            companyId, 
+            clientId: { [Op.or]: [data.customerId || null, null] }, 
+            quantity: { [Op.gt]: sequelize.col('reserved') } 
+          },
           transaction: t
         }) : null;
 
         if (!hasStockInDefault) {
           // If not in default, look for ANY warehouse with available stock
           const otherWh = await ProductStock.findOne({
-            where: { productId: product.id, companyId, clientId: data.customerId || null, quantity: { [Op.gt]: sequelize.col('reserved') } },
+            where: { 
+              productId: product.id, 
+              companyId, 
+              clientId: { [Op.or]: [data.customerId || null, null] }, 
+              quantity: { [Op.gt]: sequelize.col('reserved') } 
+            },
             transaction: t
           });
           if (otherWh) targetWarehouseId = otherWh.warehouseId;
         }
+        
+        await OrderItem.create({
+          salesOrderId: order.id,
+          productId: product.id,
+          quantity: qty,
+          unitPrice: unitPrice,
+          warehouseId: targetWarehouseId,
+        }, { transaction: t });
+        
+        total += Number(unitPrice) * qty;
 
         if (targetWarehouseId) {
           await inventoryService.reserveStock({

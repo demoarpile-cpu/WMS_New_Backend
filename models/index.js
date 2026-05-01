@@ -98,6 +98,8 @@ SalesOrder.hasMany(OrderItem, { foreignKey: 'salesOrderId', as: 'OrderItems' });
 OrderItem.belongsTo(SalesOrder, { foreignKey: 'salesOrderId', as: 'SalesOrder' });
 OrderItem.belongsTo(Product, { foreignKey: 'productId' });
 Product.hasMany(OrderItem, { foreignKey: 'productId' });
+OrderItem.belongsTo(Warehouse, { foreignKey: 'warehouseId' });
+Warehouse.hasMany(OrderItem, { foreignKey: 'warehouseId' });
 
 SalesOrder.hasMany(PickList, { foreignKey: 'salesOrderId' });
 PickList.belongsTo(SalesOrder, { foreignKey: 'salesOrderId' });

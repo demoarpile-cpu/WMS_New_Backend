@@ -250,6 +250,7 @@ async function start() {
         { t: 'companies', c: 'header_image_url', type: 'TEXT' },
         { t: 'customers', c: 'header_image_url', type: 'TEXT' },
         { t: 'suppliers', c: 'header_image_url', type: 'TEXT' },
+        { t: 'order_items', c: 'warehouse_id', type: 'INT' },
       ];
       for (const col of manualCols) {
         try {
@@ -323,6 +324,24 @@ async function start() {
     }
     
     console.log('Database synced successfully.');
+    
+    // BACKFILL warehouse_id for old OrderItems
+    try {
+      const { OrderItem, PickList } = require('./models');
+      const items = await OrderItem.findAll({ where: { warehouseId: null } });
+      if (items.length > 0) {
+        console.log(`[DB] Backfilling warehouseId for ${items.length} OrderItems...`);
+        for (const item of items) {
+          const pickList = await PickList.findOne({ where: { salesOrderId: item.salesOrderId } });
+          const warehouseId = pickList ? pickList.warehouseId : 1;
+          await item.update({ warehouseId });
+        }
+        console.log('[DB] Backfill complete.');
+      }
+    } catch (e) {
+      console.warn('[DB] Backfill error:', e.message);
+    }
+    
     // AUTO-SEED DEMO USERS if they don't exist (For 'Proper' Live Demo Experience)
     const bcrypt = require('bcryptjs');
     const { User, Company } = require('./models');

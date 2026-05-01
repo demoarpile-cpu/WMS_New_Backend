@@ -113,7 +113,12 @@ async function listProducts(reqUser, query = {}) {
     include: [
       { association: 'Category', attributes: ['id', 'name', 'code'], required: false },
       { association: 'Company', attributes: ['id', 'name', 'code'], required: false },
-      { association: 'ProductStocks', attributes: ['quantity'], required: false },
+      { 
+        association: 'ProductStocks', 
+        attributes: ['quantity', 'reserved', 'warehouseId'], 
+        required: false,
+        include: [{ association: 'Warehouse', attributes: ['id', 'name'], required: false }]
+      },
       { 
         association: 'SupplierProducts', 
         required: false,
@@ -824,6 +829,10 @@ async function createAdjustment(data, reqUser) {
   if (batchId && !batchNumber) {
     const b = await Batch.findByPk(batchId);
     if (b) batchNumber = b.batchNumber;
+  } else if (!batchId && batchNumber) {
+    // If batchNumber is provided, try to find batchId
+    const b = await Batch.findOne({ where: { productId: data.productId, batchNumber: batchNumber.trim() } });
+    if (b) batchId = b.id;
   }
 
   if (!warehouseId) throw new Error('Warehouse is mandatory for inventory booking');
@@ -838,117 +847,138 @@ async function createAdjustment(data, reqUser) {
     await warehouseService.validateCapacity(warehouseId, qty);
   }
 
-  const referenceNumber = generateAdjustmentReference();
+  const transaction = await sequelize.transaction();
 
-  // Find exact stock record for this combination
-  const stockWhere = { 
-    productId: data.productId,
-    warehouseId: warehouseId,
-    locationId: locationId || null,
-    batchNumber: batchNumber || null,
-    clientId: clientId || null
-  };
+  try {
+    const referenceNumber = generateAdjustmentReference();
 
-  let stock = await ProductStock.findOne({ where: stockWhere });
+    // Find exact stock record for this combination
+    const stockWhere = { 
+      productId: data.productId,
+      warehouseId: warehouseId,
+      locationId: locationId || null,
+      batchNumber: batchNumber || null,
+      clientId: clientId || null
+    };
 
-  if (type === 'DECREASE') {
-    if (!stock || (stock.quantity || 0) - (stock.reserved || 0) < qty) {
-      throw new Error('Insufficient available stock for this combination (Warehouse/Location/Batch)');
+    let stock = await ProductStock.findOne({ where: stockWhere, transaction });
+
+    if (type === 'DECREASE') {
+      if (!stock || (stock.quantity || 0) - (stock.reserved || 0) < qty) {
+        throw new Error('Insufficient available stock for this combination (Warehouse/Location/Batch)');
+      }
     }
-  }
 
-  const adjustment = await InventoryAdjustment.create({
-    referenceNumber,
-    companyId: effectiveCompanyId,
-    productId: data.productId,
-    warehouseId,
-    locationId,
-    batchId,
-    batchNumber,
-    bestBeforeDate,
-    clientId,
-    type,
-    quantity: qty,
-    reason: data.reason || null,
-    notes: data.notes || null,
-    status: 'PENDING',
-    createdBy: reqUser.id,
-  });
-
-  if (stock) {
-    const newQty = type === 'INCREASE' ? (stock.quantity || 0) + qty : Math.max(0, (stock.quantity || 0) - qty);
-    await stock.update({ 
-      quantity: newQty,
-      bestBeforeDate: bestBeforeDate || stock.bestBeforeDate,
-      clientId: clientId || stock.clientId,
-      userId: reqUser.id,
-      reason: data.reason || stock.reason
-    });
-  } else if (type === 'INCREASE') {
-    await ProductStock.create({
+    const adjustment = await InventoryAdjustment.create({
+      referenceNumber,
       companyId: effectiveCompanyId,
       productId: data.productId,
       warehouseId,
       locationId,
-      batchNumber,
       batchId,
+      batchNumber,
+      bestBeforeDate,
+      clientId,
+      type,
       quantity: qty,
-      reserved: 0,
+      reason: data.reason || null,
+      notes: data.notes || null,
+      status: 'PENDING',
+      createdBy: reqUser.id,
+    }, { transaction });
+
+    // 1. Update ProductStock
+    if (stock) {
+      const newQty = type === 'INCREASE' ? (stock.quantity || 0) + qty : Math.max(0, (stock.quantity || 0) - qty);
+      await stock.update({ 
+        quantity: newQty,
+        bestBeforeDate: bestBeforeDate || stock.bestBeforeDate,
+        clientId: clientId || stock.clientId,
+        userId: reqUser.id,
+        reason: data.reason || stock.reason
+      }, { transaction });
+    } else if (type === 'INCREASE') {
+      await ProductStock.create({
+        companyId: effectiveCompanyId,
+        productId: data.productId,
+        warehouseId,
+        locationId,
+        batchNumber,
+        batchId,
+        quantity: qty,
+        reserved: 0,
+        bestBeforeDate,
+        clientId,
+        userId: reqUser.id,
+        reason: data.reason,
+        status: 'ACTIVE',
+      }, { transaction });
+    }
+
+    // 2. Update Batch if provided
+    if (batchId) {
+      const b = await Batch.findByPk(batchId, { transaction });
+      if (b) {
+        const newBatchQty = type === 'INCREASE' ? (b.quantity || 0) + qty : Math.max(0, (b.quantity || 0) - qty);
+        await b.update({ quantity: newBatchQty }, { transaction });
+      }
+    }
+
+    // 3. SYNC Inventory Table (Warehouse Level)
+    const { Inventory } = require('../models');
+    const [inv] = await Inventory.findOrCreate({
+      where: { productId: data.productId, warehouseId },
+      defaults: { quantity: 0, reservedQuantity: 0 },
+      transaction
+    });
+    if (type === 'INCREASE') {
+      await inv.increment('quantity', { by: qty, transaction });
+    } else {
+      await inv.decrement('quantity', { by: qty, transaction });
+    }
+
+    // 4. Create Entry in InventoryLog for history
+    const { InventoryLog } = require('../models');
+    await InventoryLog.create({
+      productId: data.productId,
+      warehouseId,
+      locationId,
+      batchId,
+      batchNumber,
       bestBeforeDate,
       clientId,
       userId: reqUser.id,
-      reason: data.reason,
-      status: 'ACTIVE',
+      type: type === 'INCREASE' ? 'IN' : 'OUT',
+      quantity: qty,
+      reason: data.reason || (type === 'INCREASE' ? 'Stock In' : 'Stock Out'),
+      referenceId: referenceNumber
+    }, { transaction });
+
+    await adjustment.update({ status: 'COMPLETED' }, { transaction });
+    
+    await transaction.commit();
+
+    return InventoryAdjustment.findByPk(adjustment.id, {
+      include: [
+        { association: 'Product', attributes: ['id', 'name', 'sku', 'packSize'] },
+        { association: 'Warehouse', required: false, attributes: ['id', 'name'] },
+        { association: 'createdByUser', required: false, attributes: ['id', 'name', 'email'] },
+        { association: 'Location', required: false, attributes: ['id', 'name', 'code'] },
+        { association: 'Client', required: false, attributes: ['id', 'name'] },
+      ],
+    }).then((a) => {
+      const j = a.toJSON();
+      j.items = [{ product: j.Product, quantity: j.quantity }];
+      j.createdBy = j.createdByUser;
+      delete j.createdByUser;
+      delete j.Product;
+      return j;
     });
+
+  } catch (err) {
+    if (transaction) await transaction.rollback();
+    throw err;
   }
-
-  // SYNC Inventory Table (Warehouse Level)
-  const { Inventory } = require('../models');
-  const [inv] = await Inventory.findOrCreate({
-    where: { productId: data.productId, warehouseId },
-    defaults: { quantity: 0, reservedQuantity: 0 }
-  });
-  if (type === 'INCREASE') {
-    await inv.increment('quantity', { by: qty });
-  } else {
-    await inv.decrement('quantity', { by: qty });
-  }
-
-
-  // Also create a entry in InventoryLog for history
-  const { InventoryLog } = require('../models');
-  await InventoryLog.create({
-    productId: data.productId,
-    warehouseId,
-    locationId,
-    batchId,
-    batchNumber,
-    bestBeforeDate,
-    clientId,
-    userId: reqUser.id,
-    type: type === 'INCREASE' ? 'IN' : 'OUT',
-    quantity: qty,
-    reason: data.reason || (type === 'INCREASE' ? 'Stock In' : 'Stock Out'),
-    referenceId: referenceNumber
-  });
-
-  await adjustment.update({ status: 'COMPLETED' });
-  return InventoryAdjustment.findByPk(adjustment.id, {
-    include: [
-      { association: 'Product', attributes: ['id', 'name', 'sku', 'packSize'] },
-      { association: 'Warehouse', required: false, attributes: ['id', 'name'] },
-      { association: 'createdByUser', required: false, attributes: ['id', 'name', 'email'] },
-      { association: 'Location', required: false, attributes: ['id', 'name', 'code'] },
-      { association: 'Client', required: false, attributes: ['id', 'name'] },
-    ],
-  }).then((a) => {
-    const j = a.toJSON();
-    j.items = [{ product: j.Product, quantity: j.quantity }];
-    j.createdBy = j.createdByUser;
-    delete j.createdByUser;
-    delete j.Product;
-    return j;
-  });
 }
 
 async function listCycleCounts(reqUser, query = {}) {
@@ -1114,6 +1144,19 @@ async function completeCycleCount(id, data, reqUser) {
             status: 'ACTIVE'
           }, { transaction });
         }
+
+        // [FIX] Also sync Warehouse Level Total (Inventory Table)
+        const { Inventory } = require('../models');
+        const [inv] = await Inventory.findOrCreate({
+          where: { productId: pid, warehouseId: where.warehouseId },
+          defaults: { quantity: 0, reservedQuantity: 0 },
+          transaction
+        });
+        if (diff > 0) {
+          await inv.increment('quantity', { by: Math.abs(diff), transaction });
+        } else {
+          await inv.decrement('quantity', { by: Math.abs(diff), transaction });
+        }
       }
     }
 
@@ -1206,31 +1249,39 @@ async function createBatch(data, reqUser) {
     await warehouseService.validateCapacity(batch.warehouseId, batch.quantity);
   }
 
-  // Sync with ProductStock if quantity > 0
-  if (batch.quantity > 0) {
-    const stockQty = batch.quantity;
-    const stockWhere = {
-      productId: batch.productId,
-      warehouseId: batch.warehouseId,
-      locationId: batch.locationId || null,
-      batchNumber: batch.batchNumber,
-    };
+    // Sync with ProductStock if quantity > 0
+    if (batch.quantity > 0) {
+      const stockQty = batch.quantity;
+      const stockWhere = {
+        productId: batch.productId,
+        warehouseId: batch.warehouseId,
+        locationId: batch.locationId || null,
+        batchNumber: batch.batchNumber,
+      };
 
-    // Check if stock exists matching this batch
-    let stock = await ProductStock.findOne({ where: stockWhere });
-    if (stock) {
-      await stock.increment('quantity', { by: stockQty });
-    } else {
-      await ProductStock.create({
-        ...stockWhere,
-        companyId: batch.companyId,
-        quantity: stockQty,
-        reserved: 0,
-        status: 'ACTIVE',
-        expiryDate: batch.expiryDate, // Sync expiry if possible, though model might need update
+      // Check if stock exists matching this batch
+      let stock = await ProductStock.findOne({ where: stockWhere });
+      if (stock) {
+        await stock.increment('quantity', { by: stockQty });
+      } else {
+        await ProductStock.create({
+          ...stockWhere,
+          companyId: batch.companyId,
+          quantity: stockQty,
+          reserved: 0,
+          status: 'ACTIVE',
+          expiryDate: batch.expiryDate, // Sync expiry if possible, though model might need update
+        });
+      }
+
+      // [FIX] Also sync Warehouse Level Total
+      const { Inventory } = require('../models');
+      const [inv] = await Inventory.findOrCreate({
+        where: { productId: batch.productId, warehouseId: batch.warehouseId },
+        defaults: { quantity: 0, reservedQuantity: 0 }
       });
+      await inv.increment('quantity', { by: stockQty });
     }
-  }
 
   return getBatchById(batch.id, reqUser);
 }
@@ -1893,10 +1944,13 @@ async function reserveStock(data, t) {
       productId,
       warehouseId,
       companyId,
-      clientId: clientId || null,
+      clientId: { [Op.or]: [clientId || null, null] },
       quantity: { [Op.gt]: sequelize.col('reserved') }
     },
-    order: [['createdAt', 'ASC']],
+    order: [
+      [sequelize.literal('client_id IS NULL'), 'ASC'], // Non-null (specific client) first
+      ['createdAt', 'ASC']
+    ],
     transaction: t
   });
 
@@ -1935,10 +1989,13 @@ async function unreserveStock(data, t) {
       productId,
       warehouseId,
       companyId,
-      clientId: clientId || null,
+      clientId: { [Op.or]: [clientId || null, null] },
       reserved: { [Op.gt]: 0 }
     },
-    order: [['createdAt', 'DESC']],
+    order: [
+      [sequelize.literal('client_id IS NULL'), 'DESC'], // General stock last for unreserve
+      ['createdAt', 'DESC']
+    ],
     transaction: t
   });
 
@@ -1978,11 +2035,12 @@ async function shipStock(data, t) {
       productId,
       warehouseId,
       companyId,
-      clientId: clientId || null,
+      clientId: { [Op.or]: [clientId || null, null] },
       quantity: { [Op.gt]: 0 }
     },
     order: [
       [sequelize.literal('reserved DESC')], // Prioritize rows that have reservations
+      [sequelize.literal('client_id IS NULL'), 'ASC'], // Then non-null client stock
       ['createdAt', 'ASC'] // Then FIFO
     ],
     transaction: t,

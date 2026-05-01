@@ -1,5 +1,5 @@
 const { Op } = require('sequelize');
-const { GoodsReceipt, GoodsReceiptItem, PurchaseOrder, PurchaseOrderItem, Supplier, Product, ProductStock, Warehouse, Location, Batch } = require('../models');
+const { GoodsReceipt, GoodsReceiptItem, PurchaseOrder, PurchaseOrderItem, Supplier, Product, ProductStock, Warehouse, Location, Batch, Inventory, InventoryLog } = require('../models');
 const auditLogService = require('./auditLogService');
 
 function isTruthyYes(v) {
@@ -303,9 +303,12 @@ async function finalizeReceiving(id, reqUser) {
       const alreadyReceived = otherGrItems.reduce((sum, gi) => sum + (Number(gi.receivedQty) || 0), 0);
       const remainingAllowed = Number(poItem.quantity) - alreadyReceived;
 
+      // Allow over-receiving: Some users might receive more than ordered (bonus stock/samples)
+      /*
       if (qtyToBook > remainingAllowed) {
         throw new Error(`Over-receiving detected for ${item.productSku}. Ordered: ${poItem.quantity}, Already Received: ${alreadyReceived}, Attempting: ${qtyToBook}. Maximum allowed now: ${remainingAllowed}`);
       }
+      */
 
       // 6. Manage Batch (if applicable)
       if (item.batchId) {
@@ -363,6 +366,29 @@ async function finalizeReceiving(id, reqUser) {
           status: 'ACTIVE'
         }, { transaction: t });
       }
+
+      // 7.1 Sync Warehouse Inventory (Total)
+      const [inv] = await Inventory.findOrCreate({
+        where: { productId: item.productId, warehouseId: gr.warehouseId },
+        defaults: { quantity: 0, reservedQuantity: 0 },
+        transaction: t
+      });
+      await inv.increment('quantity', { by: qtyToBook, transaction: t });
+
+      // 7.2 Create Inventory Log
+      await InventoryLog.create({
+        productId: item.productId,
+        warehouseId: gr.warehouseId,
+        locationId: item.locationId || null,
+        clientId: gr.clientId || null,
+        type: 'IN',
+        quantity: qtyToBook,
+        referenceId: gr.grNumber,
+        batchNumber: item.batchId || null,
+        bestBeforeDate: item.bestBeforeDate || null,
+        reason: `Purchase Order Receipt: ${po.poNumber}`,
+        userId: reqUser.id
+      }, { transaction: t });
 
       // Update item record
       await item.update({ receivedQty: qtyToBook }, { transaction: t });

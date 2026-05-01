@@ -1,4 +1,5 @@
-const { PackingTask, PickList, SalesOrder, User } = require('../models');
+const { PackingTask, PickList, SalesOrder, User, OrderItem, sequelize } = require('../models');
+const inventoryService = require('./inventoryService');
 const { Op } = require('sequelize');
 
 async function list(reqUser, query = {}) {
@@ -33,7 +34,7 @@ async function list(reqUser, query = {}) {
         where: { status: 'PICKED' },
         required: true,
         attributes: ['id', 'status'],
-        include: ['PickListItems']
+        include: ['PickListItems', { association: 'Warehouse', attributes: ['id', 'name'] }]
       },
       { association: 'User', attributes: ['id', 'name', 'email'], required: false },
     ],
@@ -100,24 +101,56 @@ async function startPacking(id, reqUser) {
 }
 
 async function completePacking(id, reqUser) {
-  const task = await PackingTask.findByPk(id, { include: ['SalesOrder'] });
+  const task = await PackingTask.findByPk(id, { 
+    include: [
+      { 
+        association: 'SalesOrder', 
+        include: [{ association: 'OrderItems' }] 
+      },
+      { association: 'PickList' }
+    ] 
+  });
   if (!task) throw new Error('Packing task not found');
   if (reqUser.role === 'packer' && task.assignedTo !== reqUser.id) throw new Error('Not assigned to you');
   if (task.status === 'PACKED') return task; // Idempotency
 
-  // Create Shipment
-  const { Shipment } = require('../models');
-  await Shipment.create({
-    salesOrderId: task.salesOrderId,
-    companyId: task.SalesOrder.companyId, // Ensure SalesOrder is fetched
-    packedBy: reqUser.id,
-    dispatchDate: new Date(),
-    deliveryStatus: 'READY_TO_SHIP'
-  });
+  const t = await sequelize.transaction();
+  try {
+    // Create Shipment
+    const { Shipment } = require('../models');
+    await Shipment.create({
+      salesOrderId: task.salesOrderId,
+      companyId: task.SalesOrder.companyId,
+      packedBy: reqUser.id,
+      dispatchDate: new Date(),
+      deliveryStatus: 'READY_TO_SHIP'
+    }, { transaction: t });
 
-  await task.update({ status: 'PACKED', packedAt: new Date() });
-  await task.SalesOrder.update({ status: 'PACKED' });
-  return getById(id, reqUser);
+    // Deduct Stock for each order item
+    if (task.SalesOrder && task.SalesOrder.OrderItems) {
+      for (const item of task.SalesOrder.OrderItems) {
+        await inventoryService.shipStock({
+          productId: item.productId,
+          companyId: task.SalesOrder.companyId,
+          warehouseId: task.PickList.warehouseId,
+          clientId: task.SalesOrder.customerId,
+          quantity: item.quantity,
+          referenceId: task.SalesOrder.orderNumber,
+          userId: reqUser.id
+        }, t);
+      }
+    }
+
+    await task.update({ status: 'PACKED', packedAt: new Date() }, { transaction: t });
+    await task.SalesOrder.update({ status: 'SHIPPED' }, { transaction: t });
+    
+    await t.commit();
+    return getById(id, reqUser);
+  } catch (error) {
+    await t.rollback();
+    console.error('Error in completePacking (Dispatch):', error);
+    throw error;
+  }
 }
 
 async function rejectAssignment(id, reqUser) {
