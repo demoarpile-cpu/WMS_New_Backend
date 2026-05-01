@@ -145,7 +145,7 @@ GoodsReceiptItem.belongsTo(GoodsReceipt, { foreignKey: 'goodsReceiptId' });
 GoodsReceiptItem.belongsTo(Product, { foreignKey: 'productId' });
 
 // ProductStock
-Product.hasMany(ProductStock, { foreignKey: 'productId' });
+Product.hasMany(ProductStock, { foreignKey: 'productId', as: 'ProductStocks' });
 ProductStock.belongsTo(Product, { foreignKey: 'productId' });
 Warehouse.hasMany(ProductStock, { foreignKey: 'warehouseId' });
 ProductStock.belongsTo(Warehouse, { foreignKey: 'warehouseId' });

@@ -42,6 +42,7 @@ async function getPredictionData(companyId) {
     const items = await OrderItem.findAll({
         include: [{
             model: SalesOrder,
+            as: 'SalesOrder',
             where: {
                 companyId,
                 status: { [Op.in]: ['CONFIRMED', 'PICKING_IN_PROGRESS', 'PICKED', 'PACKING_IN_PROGRESS', 'PACKED', 'SHIPPED', 'DELIVERED', 'COMPLETED'] },
