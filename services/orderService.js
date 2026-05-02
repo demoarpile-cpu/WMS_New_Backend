@@ -48,7 +48,7 @@ async function create(data, reqUser) {
   try {
     const count = await SalesOrder.count({ where: { companyId }, transaction: t });
     const orderNumber = `ORD-${Date.now()}-${String(count + 1).padStart(4, '0')}`;
-    
+
     const order = await SalesOrder.create({
       companyId,
       orderNumber,
@@ -72,41 +72,59 @@ async function create(data, reqUser) {
       for (const row of data.items) {
         const product = await Product.findByPk(row.productId, { transaction: t });
         if (!product || product.companyId !== companyId) continue;
-        
+
         const unitPrice = row.unitPrice ?? product.price;
         const qty = row.quantity || 1;
-        
+
         // RESERVE STOCK
         // We prioritize the warehouse selected by the user (row.warehouseId).
-        // If not provided, we fall back to the default warehouse.
-        let targetWarehouseId = row.warehouseId || warehouse?.id;
-        
-        // Check if stock exists in the "default" warehouse first
-        const hasStockInDefault = warehouse ? await ProductStock.findOne({
-          where: { 
-            productId: product.id, 
-            warehouseId: warehouse.id, 
-            companyId, 
-            clientId: { [Op.or]: [data.customerId || null, null] }, 
-            quantity: { [Op.gt]: sequelize.col('reserved') } 
-          },
-          transaction: t
-        }) : null;
+        let targetWarehouseId = row.warehouseId;
 
-        if (!hasStockInDefault) {
-          // If not in default, look for ANY warehouse with available stock
-          const otherWh = await ProductStock.findOne({
-            where: { 
-              productId: product.id, 
-              companyId, 
-              clientId: { [Op.or]: [data.customerId || null, null] }, 
-              quantity: { [Op.gt]: sequelize.col('reserved') } 
+        if (targetWarehouseId) {
+          // Verify stock in selected warehouse
+          const hasStockInSelected = await ProductStock.findOne({
+            where: {
+              productId: product.id,
+              warehouseId: targetWarehouseId,
+              companyId,
+              quantity: { [Op.gt]: sequelize.col('reserved') }
             },
             transaction: t
           });
-          if (otherWh) targetWarehouseId = otherWh.warehouseId;
+          if (!hasStockInSelected) {
+            throw new Error(`Insufficient available stock for product ${product.sku} in selected warehouse.`);
+          }
+        } else {
+          // No warehouse selected, try default warehouse
+          targetWarehouseId = warehouse?.id;
+          const hasStockInDefault = targetWarehouseId ? await ProductStock.findOne({
+            where: {
+              productId: product.id,
+              warehouseId: targetWarehouseId,
+              companyId,
+              quantity: { [Op.gt]: sequelize.col('reserved') }
+            },
+            transaction: t
+          }) : null;
+
+          if (!hasStockInDefault) {
+            // Try ANY warehouse
+            const otherWh = await ProductStock.findOne({
+              where: {
+                productId: product.id,
+                companyId,
+                quantity: { [Op.gt]: sequelize.col('reserved') }
+              },
+              transaction: t
+            });
+            if (otherWh) {
+              targetWarehouseId = otherWh.warehouseId;
+            } else {
+              throw new Error(`Insufficient available stock for product ${product.sku} across all warehouses.`);
+            }
+          }
         }
-        
+
         await OrderItem.create({
           salesOrderId: order.id,
           productId: product.id,
@@ -114,7 +132,7 @@ async function create(data, reqUser) {
           unitPrice: unitPrice,
           warehouseId: targetWarehouseId,
         }, { transaction: t });
-        
+
         total += Number(unitPrice) * qty;
 
         if (targetWarehouseId) {
@@ -122,7 +140,6 @@ async function create(data, reqUser) {
             productId: product.id,
             companyId,
             warehouseId: targetWarehouseId,
-            clientId: data.customerId || null,
             quantity: qty
           }, t);
         } else {
@@ -132,29 +149,38 @@ async function create(data, reqUser) {
       await order.update({ totalAmount: total }, { transaction: t });
     }
 
-    if (warehouse && data.items?.length) {
+    // 5. Create PickLists for each warehouse involved
+    const orderItemsForPick = await OrderItem.findAll({ where: { salesOrderId: order.id }, transaction: t });
+    const warehouseGroups = {};
+    orderItemsForPick.forEach(item => {
+      if (!warehouseGroups[item.warehouseId]) warehouseGroups[item.warehouseId] = [];
+      warehouseGroups[item.warehouseId].push(item);
+    });
+
+    for (const whId in warehouseGroups) {
       const pickList = await PickList.create({
         salesOrderId: order.id,
-        warehouseId: warehouse.id,
+        warehouseId: whId,
         status: 'NOT_STARTED',
       }, { transaction: t });
 
-      for (const row of data.items) {
+      for (const item of warehouseGroups[whId]) {
         await PickListItem.create({
           pickListId: pickList.id,
-          productId: row.productId,
-          quantityRequired: row.quantity || 1,
+          productId: item.productId,
+          quantityRequired: item.quantity,
           quantityPicked: 0,
         }, { transaction: t });
       }
-
-      await order.update({ status: 'CONFIRMED' }, { transaction: t });
+      // Also create a PackingTask for this PickList
       await PackingTask.create({
         salesOrderId: order.id,
         pickListId: pickList.id,
         status: 'NOT_STARTED',
       }, { transaction: t });
     }
+
+    await order.update({ status: 'CONFIRMED' }, { transaction: t });
 
     await t.commit();
     return getById(order.id, reqUser);
@@ -174,7 +200,7 @@ async function update(id, data, reqUser) {
     });
     if (!order) throw new Error('Order not found');
     if (reqUser.role !== 'super_admin' && order.companyId !== reqUser.companyId) throw new Error('Order not found');
-    
+
     const allowedStatuses = ['DRAFT', 'CONFIRMED'];
     if (!allowedStatuses.includes((order.status || '').toUpperCase())) {
       throw new Error('Only DRAFT or CONFIRMED orders can be edited');
@@ -210,23 +236,23 @@ async function update(id, data, reqUser) {
     if (data.items && Array.isArray(data.items)) {
       await OrderItem.destroy({ where: { salesOrderId: order.id }, transaction: t });
       let total = 0;
-      
+
       const currentWarehouse = await Warehouse.findOne({ where: { companyId: order.companyId }, transaction: t });
-      
+
       for (const row of data.items) {
         const product = await Product.findByPk(row.productId, { transaction: t });
         if (!product || product.companyId !== order.companyId) continue;
-        
+
         const unitPrice = row.unitPrice ?? product.price;
         const qty = row.quantity || 1;
-        
+
         await OrderItem.create({
           salesOrderId: order.id,
           productId: product.id,
           quantity: qty,
           unitPrice: unitPrice,
         }, { transaction: t });
-        
+
         total += Number(unitPrice) * qty;
 
         // Re-reserve
@@ -261,7 +287,7 @@ async function remove(id, reqUser) {
     });
     if (!order) throw new Error('Order not found');
     if (reqUser.role !== 'super_admin' && order.companyId !== reqUser.companyId) throw new Error('Order not found');
-    
+
     const allowedStatuses = ['DRAFT', 'CONFIRMED', 'PICK_LIST_CREATED'];
     const status = (order.status || '').toUpperCase();
     if (!allowedStatuses.includes(status)) {

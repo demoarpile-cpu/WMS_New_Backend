@@ -163,9 +163,11 @@ async function updateReceived(id, body, reqUser) {
             transaction: t
           });
           const alreadyReceived = otherGrItems.reduce((sum, gi) => sum + (Number(gi.receivedQty) || 0), 0);
+          /*
           if ((alreadyReceived + newReceivedQty) > Number(poItem.quantity)) {
             throw new Error(`Over-receiving detected for SKU ${line.productSku}. Ordered: ${poItem.quantity}, Already finalized: ${alreadyReceived}, Attempting to set this ASN to: ${newReceivedQty}.`);
           }
+          */
         }
 
         await line.update({ 

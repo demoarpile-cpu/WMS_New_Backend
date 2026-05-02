@@ -53,7 +53,7 @@ async function validateHeatSensitivePlacement({ product, locationId, actionLabel
 async function scanBarcode(reqUser, barcode) {
   if (!barcode) throw new Error('Invalid barcode');
   const cleanBarcode = barcode.trim();
-  
+
   const where = {
     [Op.or]: [
       { barcode: cleanBarcode },
@@ -71,12 +71,12 @@ async function scanBarcode(reqUser, barcode) {
       { association: 'Category' },
       { association: 'Company' },
       { association: 'Supplier' },
-      { 
-        association: 'ProductStocks', 
+      {
+        association: 'ProductStocks',
         include: [
-          { association: 'Warehouse' }, 
+          { association: 'Warehouse' },
           { association: 'Location' }
-        ] 
+        ]
       },
       { association: 'Batches' } // Batch belongs to Product, not ProductStock
     ]
@@ -90,7 +90,7 @@ async function listProducts(reqUser, query = {}) {
   const where = {};
   if (reqUser.role !== 'super_admin') where.companyId = reqUser.companyId;
   else if (query.companyId) where.companyId = query.companyId;
-  
+
   if (query.categoryId) where.categoryId = query.categoryId;
   if (query.supplierId) {
     where[Op.or] = [
@@ -113,14 +113,14 @@ async function listProducts(reqUser, query = {}) {
     include: [
       { association: 'Category', attributes: ['id', 'name', 'code'], required: false },
       { association: 'Company', attributes: ['id', 'name', 'code'], required: false },
-      { 
-        association: 'ProductStocks', 
-        attributes: ['quantity', 'reserved', 'warehouseId'], 
+      {
+        association: 'ProductStocks',
+        attributes: ['quantity', 'reserved', 'warehouseId'],
         required: false,
         include: [{ association: 'Warehouse', attributes: ['id', 'name'], required: false }]
       },
-      { 
-        association: 'SupplierProducts', 
+      {
+        association: 'SupplierProducts',
         required: false,
         where: query.supplierId ? { supplierId: query.supplierId } : undefined
       },
@@ -213,6 +213,11 @@ async function createProduct(data, reqUser) {
   if (!companyId) throw new Error('companyId required');
   const existing = await Product.findOne({ where: { companyId, sku: data.sku.trim() } });
   if (existing) throw new Error('SKU already exists for this company');
+  const packSize = data.packSize != null ? Number(data.packSize) : 1;
+  const rawCost = data.costPrice != null ? Number(data.costPrice) : 0;
+  // We store costPrice as unit cost in the database
+  const unitCost = packSize > 0 ? (rawCost / packSize) : rawCost;
+
   const payload = {
     companyId,
     categoryId: data.categoryId || null,
@@ -225,23 +230,8 @@ async function createProduct(data, reqUser) {
     productType: data.productType || null,
     unitOfMeasure: data.unitOfMeasure || null,
     price: data.price ?? 0,
-    costPrice: (function() {
-      // If the frontend already sent the normalized unitCost as costPrice,
-      // and we want to avoid double-division, we need to be careful.
-      // Rule: costPrice = supplierCost / packSize
-      const supplierCost = data.costPrice != null ? Number(data.costPrice) : 0;
-      const packSize = data.packSize != null ? Number(data.packSize) : 1;
-      
-      // If packSize is 1, it's already a unit cost or a single item
-      if (packSize === 1) return supplierCost || null;
-      
-      // If packSize > 1, the frontend might have sent the Case Cost.
-      // But user said "Ensure only unitCost is sent". 
-      // If we strictly follow that, we should NOT divide here if it's already unit cost.
-      // Let's assume the frontend sends what it wants stored in DB.
-      return supplierCost || null;
-    })(),
-    packSize: data.packSize || 1,
+    costPrice: unitCost,
+    packSize: packSize,
     vatRate: data.vatRate != null ? data.vatRate : null,
     vatCode: data.vatCode || null,
     customsTariff: data.customsTariff != null ? String(data.customsTariff) : null,
@@ -261,11 +251,10 @@ async function createProduct(data, reqUser) {
     maxStock: data.maxStock != null ? data.maxStock : null,
     status: data.status || 'ACTIVE',
     images: Array.isArray(data.images) ? data.images : null,
-    cartons: Array.isArray(data.cartons) ? data.cartons : (data.cartons && typeof data.cartons === 'object' ? data.cartons : null),
+    cartons: Array.isArray(data.cartons) && data.cartons.length > 0 ? data.cartons : null,
     priceLists: data.priceLists && typeof data.priceLists === 'object' ? data.priceLists : null,
     supplierProducts: Array.isArray(data.supplierProducts) ? data.supplierProducts : null,
     alternativeSkus: Array.isArray(data.alternativeSkus) ? data.alternativeSkus : null,
-    packSize: data.packSize != null ? Number(data.packSize) : 1,
     bestBeforeDateWarningPeriodDays: data.bestBeforeDateWarningPeriodDays != null ? Number(data.bestBeforeDateWarningPeriodDays) : 0,
   };
   console.log('[DEBUG_SERVICE] Creating Product Payload:', JSON.stringify(payload, null, 2));
@@ -283,7 +272,7 @@ async function bulkCreateProducts(productsArray, reqUser) {
     throw new Error('No products to import');
   }
   const results = { created: 0, skipped: 0, errors: [] };
-  
+
   // Cache categories for this company to reduce DB calls and handle case-insensitive matching
   const existingCategories = await Category.findAll({ where: { companyId } });
   const categoryMap = new Map(); // lowercase name -> ID
@@ -328,15 +317,15 @@ async function bulkCreateProducts(productsArray, reqUser) {
         // If it's a numeric ID that already exists
         if (!isNaN(catInput) && categoryIdSet.has(Number(catInput))) {
           resolvedCategoryId = Number(catInput);
-          console.log(`[BULK_IMPORT] Row ${i+1}: Matched numeric ID ${resolvedCategoryId}`);
+          console.log(`[BULK_IMPORT] Row ${i + 1}: Matched numeric ID ${resolvedCategoryId}`);
         } else {
           // Treat as Name
           const lowerName = catInput.toLowerCase();
           if (categoryMap.has(lowerName)) {
             resolvedCategoryId = categoryMap.get(lowerName);
-            console.log(`[BULK_IMPORT] Row ${i+1}: Matched category name "${catInput}" to ID ${resolvedCategoryId}`);
+            console.log(`[BULK_IMPORT] Row ${i + 1}: Matched category name "${catInput}" to ID ${resolvedCategoryId}`);
           } else {
-            console.log(`[BULK_IMPORT] Row ${i+1}: Category "${catInput}" NOT found. Creating...`);
+            console.log(`[BULK_IMPORT] Row ${i + 1}: Category "${catInput}" NOT found. Creating...`);
             // Auto-create category
             const newCat = await Category.create({
               companyId,
@@ -346,7 +335,7 @@ async function bulkCreateProducts(productsArray, reqUser) {
             resolvedCategoryId = newCat.id;
             categoryMap.set(lowerName, resolvedCategoryId);
             categoryIdSet.add(resolvedCategoryId);
-            console.log(`[BULK_IMPORT] Row ${i+1}: Created new category "${catInput}" with ID ${resolvedCategoryId}`);
+            console.log(`[BULK_IMPORT] Row ${i + 1}: Created new category "${catInput}" with ID ${resolvedCategoryId}`);
           }
         }
       }
@@ -363,7 +352,7 @@ async function bulkCreateProducts(productsArray, reqUser) {
           if (supplierMap.has(lowerSup)) {
             resolvedSupplierId = supplierMap.get(lowerSup);
           } else {
-            console.log(`[BULK_IMPORT] Row ${i+1}: Supplier "${supInput}" NOT found. Creating...`);
+            console.log(`[BULK_IMPORT] Row ${i + 1}: Supplier "${supInput}" NOT found. Creating...`);
             const newSup = await Supplier.create({
               companyId,
               name: supInput,
@@ -389,7 +378,7 @@ async function bulkCreateProducts(productsArray, reqUser) {
         productType: data.productType || null,
         unitOfMeasure: data.unitOfMeasure || null,
         price: data.price != null ? Number(data.price) : 0,
-        costPrice: (function() {
+        costPrice: (function () {
           const supplierCost = data.costPrice != null ? Number(data.costPrice) : 0;
           const packSize = data.packSize != null ? Number(data.packSize) : 1;
           return packSize > 0 ? (supplierCost / packSize) : supplierCost;
@@ -450,8 +439,12 @@ async function updateProduct(id, data, reqUser) {
   if (data.productType !== undefined) upd.productType = data.productType;
   if (data.unitOfMeasure !== undefined) upd.unitOfMeasure = data.unitOfMeasure;
   if (data.price !== undefined) upd.price = data.price;
-  if (data.costPrice !== undefined) upd.costPrice = data.costPrice;
-  if (data.packSize !== undefined) upd.packSize = data.packSize;
+  if (data.packSize !== undefined) upd.packSize = data.packSize != null ? Number(data.packSize) : product.packSize;
+  if (data.costPrice !== undefined) {
+    const newPackSize = upd.packSize !== undefined ? upd.packSize : product.packSize;
+    const rawCost = Number(data.costPrice) || 0;
+    upd.costPrice = newPackSize > 0 ? (rawCost / newPackSize) : rawCost;
+  }
   if (data.vatRate !== undefined) upd.vatRate = data.vatRate;
   if (data.vatCode !== undefined) upd.vatCode = data.vatCode;
   if (data.customsTariff !== undefined) upd.customsTariff = data.customsTariff != null ? String(data.customsTariff) : null;
@@ -475,7 +468,7 @@ async function updateProduct(id, data, reqUser) {
   if (data.priceLists !== undefined) upd.priceLists = data.priceLists && typeof data.priceLists === 'object' ? data.priceLists : product.priceLists;
   if (data.supplierProducts !== undefined) upd.supplierProducts = Array.isArray(data.supplierProducts) ? data.supplierProducts : product.supplierProducts;
   if (data.alternativeSkus !== undefined) upd.alternativeSkus = Array.isArray(data.alternativeSkus) ? data.alternativeSkus : product.alternativeSkus;
-  if (data.packSize !== undefined) upd.packSize = data.packSize != null ? Number(data.packSize) : product.packSize;
+
   if (data.bestBeforeDateWarningPeriodDays !== undefined) upd.bestBeforeDateWarningPeriodDays = data.bestBeforeDateWarningPeriodDays != null ? Number(data.bestBeforeDateWarningPeriodDays) : product.bestBeforeDateWarningPeriodDays;
   if (Object.keys(upd).length === 0) return normalizeProductJson(product);
   console.log('[DEBUG_SERVICE] Final Update Object:', JSON.stringify(upd, null, 2));
@@ -579,7 +572,7 @@ async function listStock(reqUser, query = {}) {
   } else if (query.clientId) {
     where.clientId = query.clientId;
   }
-  
+
   if (query.warehouseId) where.warehouseId = query.warehouseId;
   if (query.productId) where.productId = query.productId;
   if (query.locationId) where.locationId = query.locationId;
@@ -853,7 +846,7 @@ async function createAdjustment(data, reqUser) {
     const referenceNumber = generateAdjustmentReference();
 
     // Find exact stock record for this combination
-    const stockWhere = { 
+    const stockWhere = {
       productId: data.productId,
       warehouseId: warehouseId,
       locationId: locationId || null,
@@ -890,7 +883,7 @@ async function createAdjustment(data, reqUser) {
     // 1. Update ProductStock
     if (stock) {
       const newQty = type === 'INCREASE' ? (stock.quantity || 0) + qty : Math.max(0, (stock.quantity || 0) - qty);
-      await stock.update({ 
+      await stock.update({
         quantity: newQty,
         bestBeforeDate: bestBeforeDate || stock.bestBeforeDate,
         clientId: clientId || stock.clientId,
@@ -955,7 +948,7 @@ async function createAdjustment(data, reqUser) {
     }, { transaction });
 
     await adjustment.update({ status: 'COMPLETED' }, { transaction });
-    
+
     await transaction.commit();
 
     return InventoryAdjustment.findByPk(adjustment.id, {
@@ -1249,39 +1242,39 @@ async function createBatch(data, reqUser) {
     await warehouseService.validateCapacity(batch.warehouseId, batch.quantity);
   }
 
-    // Sync with ProductStock if quantity > 0
-    if (batch.quantity > 0) {
-      const stockQty = batch.quantity;
-      const stockWhere = {
-        productId: batch.productId,
-        warehouseId: batch.warehouseId,
-        locationId: batch.locationId || null,
-        batchNumber: batch.batchNumber,
-      };
+  // Sync with ProductStock if quantity > 0
+  if (batch.quantity > 0) {
+    const stockQty = batch.quantity;
+    const stockWhere = {
+      productId: batch.productId,
+      warehouseId: batch.warehouseId,
+      locationId: batch.locationId || null,
+      batchNumber: batch.batchNumber,
+    };
 
-      // Check if stock exists matching this batch
-      let stock = await ProductStock.findOne({ where: stockWhere });
-      if (stock) {
-        await stock.increment('quantity', { by: stockQty });
-      } else {
-        await ProductStock.create({
-          ...stockWhere,
-          companyId: batch.companyId,
-          quantity: stockQty,
-          reserved: 0,
-          status: 'ACTIVE',
-          expiryDate: batch.expiryDate, // Sync expiry if possible, though model might need update
-        });
-      }
-
-      // [FIX] Also sync Warehouse Level Total
-      const { Inventory } = require('../models');
-      const [inv] = await Inventory.findOrCreate({
-        where: { productId: batch.productId, warehouseId: batch.warehouseId },
-        defaults: { quantity: 0, reservedQuantity: 0 }
+    // Check if stock exists matching this batch
+    let stock = await ProductStock.findOne({ where: stockWhere });
+    if (stock) {
+      await stock.increment('quantity', { by: stockQty });
+    } else {
+      await ProductStock.create({
+        ...stockWhere,
+        companyId: batch.companyId,
+        quantity: stockQty,
+        reserved: 0,
+        status: 'ACTIVE',
+        expiryDate: batch.expiryDate, // Sync expiry if possible, though model might need update
       });
-      await inv.increment('quantity', { by: stockQty });
     }
+
+    // [FIX] Also sync Warehouse Level Total
+    const { Inventory } = require('../models');
+    const [inv] = await Inventory.findOrCreate({
+      where: { productId: batch.productId, warehouseId: batch.warehouseId },
+      defaults: { quantity: 0, reservedQuantity: 0 }
+    });
+    await inv.increment('quantity', { by: stockQty });
+  }
 
   return getBatchById(batch.id, reqUser);
 }
@@ -1628,9 +1621,9 @@ async function listInventoryLogs(reqUser, query = {}) {
 
 async function stockIn(data, reqUser) {
   const { Inventory, InventoryLog, Product, ProductStock } = require('../models');
-  const { 
-    productId, warehouseId, locationId, clientId, 
-    quantity, referenceId, batchNumber, bestBeforeDate, reason 
+  const {
+    productId, warehouseId, locationId, clientId,
+    quantity, referenceId, batchNumber, bestBeforeDate, reason
   } = data;
 
   if (!clientId) throw new Error('Client is required for stock entry');
@@ -1656,10 +1649,10 @@ async function stockIn(data, reqUser) {
 
   // 2. Sync Granular Stock (Batch + Location)
   const [stock] = await ProductStock.findOrCreate({
-    where: { 
-      productId, 
-      warehouseId, 
-      locationId: locationId || null, 
+    where: {
+      productId,
+      warehouseId,
+      locationId: locationId || null,
       batchNumber: batchNumber.trim(),
       clientId: clientId || null
     },
@@ -1673,9 +1666,9 @@ async function stockIn(data, reqUser) {
   });
   await stock.increment('quantity', { by: quantity });
   if (stock.bestBeforeDate !== bestBeforeDate) {
-     await stock.update({ bestBeforeDate });
+    await stock.update({ bestBeforeDate });
   }
-  
+
   // 3. Create Audit Log
   await InventoryLog.create({
     productId,
@@ -1723,7 +1716,7 @@ async function stockOut(data, reqUser) {
 async function transferStock(data, reqUser) {
   const { ProductStock, InventoryLog, sequelize } = require('../models');
   const { productId, fromLocationId, toLocationId, clientId, quantity, batchNumber, bestBeforeDate, reason } = data;
-  
+
   const fromWarehouseId = data.fromWarehouseId || data.warehouseId;
   const toWarehouseId = data.toWarehouseId || fromWarehouseId;
 
@@ -1744,7 +1737,7 @@ async function transferStock(data, reqUser) {
     throw new Error(`${product.name || 'This product'} requires a Best Before (Expiry) Date for this transfer`);
   }
   await validateHeatSensitivePlacement({ product, locationId: toLocationId, actionLabel: 'transferred' });
-  
+
   return sequelize.transaction(async (t) => {
     // 1. Check Source
     const sourceBaseWhere = {
@@ -1784,17 +1777,17 @@ async function transferStock(data, reqUser) {
 
     // 2. Add/Find Destination
     const [dest, created] = await ProductStock.findOrCreate({
-      where: { 
-        productId, 
-        warehouseId: toWarehouseId, 
-        locationId: toLocationId, 
-        batchNumber: batchNumber || source.batchNumber || null 
+      where: {
+        productId,
+        warehouseId: toWarehouseId,
+        locationId: toLocationId,
+        batchNumber: batchNumber || source.batchNumber || null
       },
-      defaults: { 
+      defaults: {
         companyId: product.companyId,
-        quantity: 0, 
-        reserved: 0, 
-        clientId: clientId || source.clientId, 
+        quantity: 0,
+        reserved: 0,
+        clientId: clientId || source.clientId,
         bestBeforeDate: bestBeforeDate || source.bestBeforeDate,
         status: 'ACTIVE'
       },
@@ -1815,20 +1808,20 @@ async function transferStock(data, reqUser) {
 
     // SYNC Inventory Table (Warehouse Level)
     const { Inventory } = require('../models');
-    
+
     // Decrement from source warehouse total
     const [sourceInv] = await Inventory.findOrCreate({
-        where: { productId, warehouseId: fromWarehouseId },
-        defaults: { quantity: 0, reservedQuantity: 0 },
-        transaction: t
+      where: { productId, warehouseId: fromWarehouseId },
+      defaults: { quantity: 0, reservedQuantity: 0 },
+      transaction: t
     });
     await sourceInv.decrement('quantity', { by: qty, transaction: t });
 
     // Increment to destination warehouse total
     const [destInv] = await Inventory.findOrCreate({
-        where: { productId, warehouseId: toWarehouseId },
-        defaults: { quantity: 0, reservedQuantity: 0 },
-        transaction: t
+      where: { productId, warehouseId: toWarehouseId },
+      defaults: { quantity: 0, reservedQuantity: 0 },
+      transaction: t
     });
     await destInv.increment('quantity', { by: qty, transaction: t });
 
@@ -1944,7 +1937,6 @@ async function reserveStock(data, t) {
       productId,
       warehouseId,
       companyId,
-      clientId: { [Op.or]: [clientId || null, null] },
       quantity: { [Op.gt]: sequelize.col('reserved') }
     },
     order: [
@@ -1964,7 +1956,7 @@ async function reserveStock(data, t) {
     if (remaining <= 0) break;
     const availableInRow = Number(row.quantity) - Number(row.reserved);
     const toReserve = Math.min(availableInRow, remaining);
-    
+
     await row.increment('reserved', { by: toReserve, transaction: t });
     remaining -= toReserve;
   }
@@ -1989,7 +1981,6 @@ async function unreserveStock(data, t) {
       productId,
       warehouseId,
       companyId,
-      clientId: { [Op.or]: [clientId || null, null] },
       reserved: { [Op.gt]: 0 }
     },
     order: [
@@ -2004,7 +1995,7 @@ async function unreserveStock(data, t) {
     if (remaining <= 0) break;
     const reservedInRow = Number(row.reserved);
     const toUnreserve = Math.min(reservedInRow, remaining);
-    
+
     await row.decrement('reserved', { by: toUnreserve, transaction: t });
     remaining -= toUnreserve;
   }
@@ -2035,7 +2026,6 @@ async function shipStock(data, t) {
       productId,
       warehouseId,
       companyId,
-      clientId: { [Op.or]: [clientId || null, null] },
       quantity: { [Op.gt]: 0 }
     },
     order: [
@@ -2058,15 +2048,15 @@ async function shipStock(data, t) {
     const rowQty = Number(row.quantity);
     const rowRes = Number(row.reserved);
     const toDeduct = Math.min(rowQty, remaining);
-    
+
     // Deduct from reserved as much as possible, then from free stock
     const resDeduct = Math.min(rowRes, toDeduct);
-    
+
     await row.decrement('quantity', { by: toDeduct, transaction: t });
     if (resDeduct > 0) {
       await row.decrement('reserved', { by: resDeduct, transaction: t });
     }
-    
+
     remaining -= toDeduct;
   }
 

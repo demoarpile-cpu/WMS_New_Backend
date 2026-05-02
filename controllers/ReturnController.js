@@ -1,4 +1,4 @@
-const { Return, SalesOrder, Shipment, Customer, Product, ProductStock, sequelize } = require('../models');
+const { Return, SalesOrder, Shipment, Customer, Product, ProductStock, OrderItem, PickList, Inventory, sequelize } = require('../models');
 
 exports.createRMA = async (req, res) => {
     const { salesOrderId, shipmentId, reason, returnType, notes, items } = req.body;
@@ -134,8 +134,40 @@ exports.inspectRMA = async (req, res) => {
             inspectedAt: new Date()
         });
 
-        // NOTE: Inventory updates (add stock) would happen here if APPROVED outcome
-        // For now, we focus on status flow.
+        if (outcome === 'APPROVED') {
+            // Find warehouseId from PickList
+            const pickList = await PickList.findOne({ where: { salesOrderId: rma.salesOrderId } });
+            const orderItems = await OrderItem.findAll({ where: { salesOrderId: rma.salesOrderId } });
+            
+            // Re-stock all returned items
+            for (const item of orderItems) {
+                const warehouseId = pickList ? pickList.warehouseId : item.warehouseId;
+                if (!warehouseId) continue;
+                
+                // Add to overall Inventory
+                const [inventory] = await Inventory.findOrCreate({
+                    where: { productId: item.productId, warehouseId },
+                    defaults: { quantity: 0, reservedQuantity: 0 }
+                });
+                await inventory.increment('quantity', { by: item.quantity });
+                
+                // Add back to ProductStock (using 'RETURNED' as batch for tracking)
+                const [stock] = await ProductStock.findOrCreate({
+                    where: {
+                        productId: item.productId,
+                        warehouseId,
+                        batchNumber: 'RETURNED'
+                    },
+                    defaults: {
+                        companyId: rma.companyId,
+                        quantity: 0,
+                        status: 'ACTIVE',
+                        clientId: rma.customerId || null
+                    }
+                });
+                await stock.increment('quantity', { by: item.quantity });
+            }
+        }
 
         res.json({ success: true, data: rma });
     } catch (error) {

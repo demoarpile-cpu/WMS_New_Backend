@@ -323,7 +323,8 @@ async function getEffectiveCostPrice(productId, companyId, asOfDate = null) {
 
     // Take the first one per supplier (already sorted by effectiveDate DESC)
     if (!bySupplier[sid]) {
-      bySupplier[sid] = Number(sp.costPrice) || 0;
+      const packSize = Number(sp.packSize) || 1;
+      bySupplier[sid] = (Number(sp.costPrice) || 0) / packSize;
     }
   }
 

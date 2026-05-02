@@ -101,14 +101,14 @@ async function startPacking(id, reqUser) {
 }
 
 async function completePacking(id, reqUser) {
-  const task = await PackingTask.findByPk(id, { 
+  const task = await PackingTask.findByPk(id, {
     include: [
-      { 
-        association: 'SalesOrder', 
-        include: [{ association: 'OrderItems' }] 
+      {
+        association: 'SalesOrder',
+        include: [{ association: 'OrderItems' }]
       },
       { association: 'PickList' }
-    ] 
+    ]
   });
   if (!task) throw new Error('Packing task not found');
   if (reqUser.role === 'packer' && task.assignedTo !== reqUser.id) throw new Error('Not assigned to you');
@@ -142,8 +142,8 @@ async function completePacking(id, reqUser) {
     }
 
     await task.update({ status: 'PACKED', packedAt: new Date() }, { transaction: t });
-    await task.SalesOrder.update({ status: 'SHIPPED' }, { transaction: t });
-    
+    await task.SalesOrder.update({ status: 'PACKED' }, { transaction: t });
+
     await t.commit();
     return getById(id, reqUser);
   } catch (error) {
