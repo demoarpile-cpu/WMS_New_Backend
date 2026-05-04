@@ -255,7 +255,7 @@ async function start() {
       for (const col of manualCols) {
         try {
           await sequelize.query(`ALTER TABLE ${col.t} ADD COLUMN ${col.c} ${col.type} NULL`);
-          console.log(`[DB] Column ${col.t}.${col.c} added successfully`);
+          // console.log(`[DB] Column ${col.t}.${col.c} added successfully`);
         } catch (err) {
           if (!err.message.includes('Duplicate column') && !err.message.includes('Table') && !err.message.includes("doesn't exist")) {
             console.warn(`[DB] Column ${col.t}.${col.c} error: ${err.message.slice(0, 60)}`);
@@ -273,7 +273,7 @@ async function start() {
       for (const col of manualAlters) {
         try {
           await sequelize.query(`ALTER TABLE ${col.t} MODIFY COLUMN ${col.c} ${col.type}`);
-          console.log(`[DB] Column ${col.t}.${col.c} altered to ${col.type}`);
+          // console.log(`[DB] Column ${col.t}.${col.c} altered to ${col.type}`);
         } catch (err) {
           // ignore if table/col doesn't exist yet, it will be created by sync
         }
@@ -336,7 +336,7 @@ async function start() {
           const warehouseId = pickList ? pickList.warehouseId : 1;
           await item.update({ warehouseId });
         }
-        console.log('[DB] Backfill complete.');
+        // console.log('[DB] Backfill complete.');
       }
     } catch (e) {
       console.warn('[DB] Backfill error:', e.message);

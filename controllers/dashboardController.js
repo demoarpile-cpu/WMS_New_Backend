@@ -200,8 +200,18 @@ async function charts(req, res, next) {
     });
     const ordersByStatus = Object.entries(statusMap).map(([status, count]) => ({ status, count }));
 
-    // Process Stock by Customer/Warehouse (Optional, simplified for now)
-    // ...
+    // Process Stock Distribution
+    const stockByWarehouse = await Promise.all(
+      warehouses.map(async (wh) => {
+        const total = await ProductStock.sum('quantity', {
+          where: { warehouseId: wh.id },
+        });
+        return {
+          name: wh.name,
+          stock: total || 0,
+        };
+      })
+    );
 
     // Process Top Selling Products
     const productStats = {};
@@ -234,7 +244,7 @@ async function charts(req, res, next) {
           sold: p.qty,
           revenue: p.revenue
         })),
-        // stockByWarehouse // Removed to save query time if not used on main dashboard yet
+        stockByWarehouse
       },
     });
   } catch (err) {

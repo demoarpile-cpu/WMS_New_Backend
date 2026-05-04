@@ -10,7 +10,7 @@ if (process.env.MYSQL_URL || process.env.DATABASE_URL) {
   // Priority 1: Use connection string (like mysql://user:pass@host:port/database)
   sequelize = new Sequelize(process.env.MYSQL_URL || process.env.DATABASE_URL, {
     dialect: 'mysql',
-    logging: process.env.NODE_ENV === 'development' ? console.log : false,
+    logging: false,
     pool: {
       max: 5,
       min: 0,
@@ -30,7 +30,7 @@ if (process.env.MYSQL_URL || process.env.DATABASE_URL) {
     host: dbHost,
     port: dbPort,
     dialect: 'mysql',
-    logging: process.env.NODE_ENV === 'development' ? console.log : false,
+    logging: false,
     pool: {
       max: 5,
       min: 0,
@@ -44,7 +44,7 @@ if (process.env.MYSQL_URL || process.env.DATABASE_URL) {
   sequelize = new Sequelize({
     dialect: 'sqlite',
     storage: sqlitePath,
-    logging: process.env.NODE_ENV === 'development' ? console.log : false,
+    logging: false,
   });
 }
 

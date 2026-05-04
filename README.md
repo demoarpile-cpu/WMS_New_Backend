@@ -1,6 +1,6 @@
 # WMS Backend
 
-Backend for Kiaan WMS with role hierarchy: **Super Admin → Company → Company Admin → Staff (Warehouse Manager, Inventory Manager, Picker, Packer, Viewer)**.
+Backend forWMS with role hierarchy: **Super Admin → Company → Company Admin → Staff (Warehouse Manager, Inventory Manager, Picker, Packer, Viewer)**.
 
 ## Structure
 
